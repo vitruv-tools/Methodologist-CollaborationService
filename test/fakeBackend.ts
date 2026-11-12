@@ -1,11 +1,6 @@
-import { createServer, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { bearerToken, startFakeServer, type FakeAnswer } from './fakeServer.js';
 
-/** What the fake backend answers to a request for a project's details. */
-export type FakeAnswer =
-  | { status: number; body?: unknown }
-  /** Never answers, like a backend that hangs. */
-  | 'hang';
+export type { FakeAnswer } from './fakeServer.js';
 
 export interface FakeBackend {
   url: string;
@@ -27,30 +22,13 @@ export async function startFakeBackend(
   answer: (token: string | undefined, projectId: string) => FakeAnswer,
 ): Promise<FakeBackend> {
   const requests: FakeBackend['requests'] = [];
-  const server: Server = createServer((request, response) => {
-    const authorization = request.headers.authorization;
-    requests.push({ path: request.url ?? '', authorization });
-    const match = /^\/api\/v1\/vsums\/(\d+)\/details$/.exec(request.url ?? '');
+  const server = await startFakeServer((request) => {
+    requests.push({ path: request.path, authorization: request.authorization });
+    const match = /^\/api\/v1\/vsums\/(\d+)\/details$/.exec(request.path);
     if (request.method !== 'GET' || match === null) {
-      response.writeHead(404).end();
-      return;
+      return { status: 404 };
     }
-    const token = /^Bearer (.+)$/.exec(authorization ?? '')?.[1];
-    const result = answer(token, match[1]);
-    if (result === 'hang') {
-      return;
-    }
-    response.writeHead(result.status, { 'Content-Type': 'application/json' });
-    response.end(typeof result.body === 'string' ? result.body : JSON.stringify(result.body ?? {}));
+    return answer(bearerToken(request), match[1]);
   });
-  await new Promise<void>((resolve) => server.listen(0, resolve));
-  return {
-    url: `http://localhost:${(server.address() as AddressInfo).port}`,
-    requests,
-    close: () =>
-      new Promise((resolve) => {
-        server.close(() => resolve());
-        server.closeAllConnections();
-      }),
-  };
+  return { url: server.url, requests, close: server.close };
 }

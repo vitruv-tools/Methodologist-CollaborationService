@@ -50,7 +50,11 @@ jobs:
 
       - name: Start container and check /health
         run: |
-          docker run -d --name collaboration-service -p 1234:1234 collaboration-service
+          # The server doesn't contact Keycloak when it starts, so placeholders are enough here.
+          docker run -d --name collaboration-service -p 1234:1234 \
+            -e KEYCLOAK_URL=http://localhost:7668 \
+            -e KEYCLOAK_CLIENT_SECRET=not-used-by-this-check \
+            collaboration-service
           for i in $(seq 1 15); do
             if curl -fsS http://localhost:1234/health; then exit 0; fi
             sleep 1

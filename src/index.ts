@@ -1,7 +1,14 @@
-import { loadConfig } from './config.js';
+import { loadConfig, type Config } from './config.js';
 import { createCollaborationServer } from './server.js';
 
-const config = loadConfig();
+let config: Config;
+try {
+  config = loadConfig();
+} catch (error) {
+  console.error(`Invalid configuration: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+}
+
 const server = createCollaborationServer({ backendUrl: config.backendUrl });
 
 const port = await server.listen(config.port);
