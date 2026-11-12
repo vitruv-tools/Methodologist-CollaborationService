@@ -11,6 +11,12 @@ console.log(`Collaboration server listening on port ${port}`);
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   process.once(signal, () => {
     console.log(`Received ${signal}, shutting down`);
-    server.close().finally(() => process.exit(0));
+    server.close().then(
+      () => process.exit(0),
+      (error: unknown) => {
+        console.error('Shutdown failed', error);
+        process.exit(1);
+      },
+    );
   });
 }
