@@ -3,7 +3,13 @@ import { docs } from 'y-websocket/bin/utils';
 import type { Doc, Map as YMap } from 'yjs';
 import { BackendError } from '../src/backend.js';
 import { SERVER_ORIGIN, setWritebackError } from '../src/projectSync.js';
-import { createRooms, isRetryable, RoomsClosedError, type Rooms } from '../src/rooms.js';
+import {
+  createRooms,
+  isRetryable,
+  OutdatedDocumentError,
+  RoomsClosedError,
+  type Rooms,
+} from '../src/rooms.js';
 import { ServiceTokenError } from '../src/serviceToken.js';
 import { Y } from '../src/yjs.js';
 import { FakeProjects, gate } from './fakeProjects.js';
@@ -511,5 +517,98 @@ describe('regenerating and closing', () => {
 
     expect(storedName()).toBe('Vehicle');
     expect(backend.requests).toHaveLength(2);
+  });
+});
+
+describe('epochs', () => {
+  const epochOf = (doc: Doc) => doc.getMap('status').get('epoch');
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+  it('gives each new room a random epoch in status, set by the server', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    backend.add('2');
+    const other = await rooms.join('vsum:2', '2');
+
+    expect(epochOf(doc)).toMatch(UUID);
+    expect(epochOf(other.doc)).toMatch(UUID);
+    expect(epochOf(other.doc)).not.toBe(epochOf(doc));
+  });
+
+  it('gives a room a new epoch when it is created again', async () => {
+    const first = await rooms.join('vsum:1', '1');
+    const epoch = epochOf(first.doc);
+    first.release();
+    await vi.waitFor(() => expect(docs.has('vsum:1')).toBe(false));
+
+    const second = await rooms.join('vsum:1', '1');
+
+    expect(epochOf(second.doc)).toMatch(UUID);
+    expect(epochOf(second.doc)).not.toBe(epoch);
+  });
+
+  it("sets the epoch with the server's origin, so it starts no writeback and is never written back", async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    rename(doc, 'Vehicle');
+
+    await vi.waitFor(() => expect(storedName()).toBe('Vehicle'));
+
+    expect(JSON.stringify(backend.requests)).not.toContain(String(epochOf(doc)));
+  });
+
+  it('lets a document of the current room join with its epoch', async () => {
+    const alice = await rooms.join('vsum:1', '1');
+
+    const again = await rooms.join('vsum:1', '1', String(epochOf(alice.doc)));
+
+    expect(again.doc).toBe(alice.doc);
+  });
+
+  it('rejects a document whose room no longer exists, without loading the project', async () => {
+    const alice = await rooms.join('vsum:1', '1');
+    const epoch = String(epochOf(alice.doc));
+    alice.release();
+    await vi.waitFor(() => expect(docs.has('vsum:1')).toBe(false));
+
+    await expect(rooms.join('vsum:1', '1', epoch)).rejects.toBeInstanceOf(OutdatedDocumentError);
+
+    expect(backend.loads).toEqual(['1']);
+    expect(docs.has('vsum:1')).toBe(false);
+  });
+
+  it('rejects a document of an earlier room after the room was created again', async () => {
+    const alice = await rooms.join('vsum:1', '1');
+    const epoch = String(epochOf(alice.doc));
+    alice.release();
+    await vi.waitFor(() => expect(docs.has('vsum:1')).toBe(false));
+    const bob = await rooms.join('vsum:1', '1');
+
+    await expect(rooms.join('vsum:1', '1', epoch)).rejects.toBeInstanceOf(OutdatedDocumentError);
+
+    // The rejected join doesn't count as a user: when Bob leaves, the room is dropped.
+    bob.release();
+    await vi.waitFor(() => expect(docs.has('vsum:1')).toBe(false));
+  });
+
+  it('lets a document join its room while that waits for its last writeback', async () => {
+    const saving = gate();
+    backend.nextSyncs.push(saving.interruption);
+    const alice = await rooms.join('vsum:1', '1');
+    const epoch = String(epochOf(alice.doc));
+    rename(alice.doc, 'Vehicle');
+    alice.release();
+    await vi.waitFor(() => expect(backend.requests).toHaveLength(1));
+
+    const again = await rooms.join('vsum:1', '1', epoch);
+    saving.open();
+
+    expect(again.doc).toBe(alice.doc);
+    again.release();
+  });
+
+  it('checks the epoch, not what a client wrote into status', async () => {
+    const alice = await rooms.join('vsum:1', '1');
+    edit(alice.doc, () => alice.doc.getMap('status').set('epoch', 'forged'));
+
+    await expect(rooms.join('vsum:1', '1', 'forged')).rejects.toBeInstanceOf(OutdatedDocumentError);
   });
 });

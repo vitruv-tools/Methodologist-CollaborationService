@@ -1,5 +1,6 @@
 import { docs, getYDoc, type WSSharedDoc } from 'y-websocket/bin/utils';
 import { BackendError, type BackendClient, type ProjectDetails } from './backend.js';
+import { EPOCH, STATUS } from './document.js';
 import { describeError } from './errors.js';
 import {
   applyBackendState,
@@ -32,15 +33,30 @@ export interface Rooms {
    * Joins the room of a project. The first join loads the project into a new document; later ones
    * wait for that. Every join must be released when its connection ends.
    *
+   * `epoch` is the epoch of the client's document, if it has one (see `StatusFields.epoch`). Then
+   * the client may only join the current room with that epoch: it never creates or loads one.
+   *
    * @throws BackendError or ServiceTokenError if loading the project failed
    * @throws RoomsClosedError if the rooms are being closed
+   * @throws OutdatedDocumentError if `epoch` is given but isn't the current room's
    */
-  join(roomName: string, projectId: string): Promise<JoinedRoom>;
+  join(roomName: string, projectId: string, epoch?: string): Promise<JoinedRoom>;
   /**
    * Writes back the changes of all rooms, once, and drops the rooms. Gives up waiting after
    * `timeoutMs`. Later joins fail.
    */
   closeAll(timeoutMs: number): Promise<void>;
+}
+
+/**
+ * Thrown by {@link Rooms.join} for a document of a room that no longer exists: its epoch isn't the
+ * current room's, or the project has no room.
+ */
+export class OutdatedDocumentError extends Error {
+  constructor() {
+    super('The document belongs to an earlier room of the project');
+    this.name = 'OutdatedDocumentError';
+  }
 }
 
 /** Thrown by {@link Rooms.join} once the rooms are being closed. */
@@ -55,6 +71,8 @@ interface Room {
   readonly name: string;
   readonly projectId: string;
   readonly doc: WSSharedDoc;
+  /** Random ID of this room, in the document's `status` (see `StatusFields.epoch`). */
+  readonly epoch: string;
   /** Resolves when the project was loaded into the document. */
   loaded: Promise<void>;
   isLoaded: boolean;
@@ -99,6 +117,7 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
       name,
       projectId,
       doc: getYDoc(name),
+      epoch: crypto.randomUUID(),
       loaded: Promise.resolve(),
       isLoaded: false,
       users: 0,
@@ -121,6 +140,7 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
       throw new RoomsClosedError();
     }
     const skipped = fillDocument(room.doc, project);
+    room.doc.transact(() => room.doc.getMap(STATUS).set(EPOCH, room.epoch), SERVER_ORIGIN);
     if (skipped.length > 0) {
       console.error(
         `Left out layout entries of ${room.name} that can't be stored: ${skipped.join(', ')}`,
@@ -213,11 +233,14 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
   }
 
   return {
-    async join(roomName, projectId) {
+    async join(roomName, projectId, epoch) {
       if (closing) {
         throw new RoomsClosedError();
       }
       let room = rooms.get(roomName);
+      if (epoch !== undefined && (room === undefined || room.epoch !== epoch)) {
+        throw new OutdatedDocumentError();
+      }
       if (room === undefined) {
         room = open(roomName, projectId);
         rooms.set(roomName, room);
