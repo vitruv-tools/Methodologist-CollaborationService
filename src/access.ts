@@ -1,3 +1,5 @@
+import { describeError } from './errors.js';
+
 /** Role of a user in a project, as returned by the backend. */
 export type Role = 'OWNER' | 'MEMBER' | 'VIEWER';
 
@@ -72,7 +74,7 @@ export async function fetchRole(
       await response.body?.cancel();
     }
   } catch (error) {
-    throw new AccessError(503, `The backend is not available: ${describe(error)}`);
+    throw new AccessError(503, `The backend is not available: ${describeError(error)}`);
   }
 
   if (status === 401) {
@@ -89,12 +91,4 @@ export async function fetchRole(
     throw new AccessError(503, 'The backend answered without a known role');
   }
   return role as Role;
-}
-
-function describe(error: unknown): string {
-  if (!(error instanceof Error)) {
-    return String(error);
-  }
-  // fetch reports network problems as "fetch failed" and puts the reason into `cause`.
-  return error.cause instanceof Error ? `${error.message} (${error.cause.message})` : error.message;
 }
