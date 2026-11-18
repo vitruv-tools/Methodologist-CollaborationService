@@ -3,6 +3,7 @@ import { BackendError, type BackendClient, type ProjectDetails } from './backend
 import { describeError } from './errors.js';
 import {
   applyBackendState,
+  applyProject,
   DocumentError,
   fillDocument,
   SERVER_ORIGIN,
@@ -11,7 +12,12 @@ import {
   type SentState,
 } from './projectSync.js';
 import { ServiceTokenError } from './serviceToken.js';
-import { createWriteback, type Writeback, type WritebackTimings } from './writeback.js';
+import {
+  createWriteback,
+  DEFAULT_WRITEBACK_TIMINGS,
+  type Writeback,
+  type WritebackTimings,
+} from './writeback.js';
 
 export interface RoomsOptions {
   /** Loads projects and writes their changes back. */
@@ -41,6 +47,22 @@ export interface Rooms {
    * `timeoutMs`. Later joins fail.
    */
   closeAll(timeoutMs: number): Promise<void>;
+  /**
+   * Brings changes the backend got outside the document into the room's document, e.g. a version
+   * restore. Does nothing if the project has no room; the next user loads it fresh.
+   *
+   * The room's writeback is paused right away, before this returns, and stays paused until the
+   * reload is done: a writeback, which always sends the complete state, would undo the backend's
+   * change. A writeback that is already running is waited for. Then the project is loaded (retried
+   * with a growing delay if that fails) and only the differences are applied to the document, so
+   * the connected clients keep their connection and receive them like any other change. The backend
+   * wins: changes made in the document that weren't written back yet are dropped.
+   *
+   * A room nobody uses anymore (kept because its changes weren't written back) is dropped instead.
+   * Calls during a reload make it load the project once more afterwards. Resolves when the reload is
+   * done; never rejects.
+   */
+  reload(roomName: string): Promise<void>;
 }
 
 /** Thrown by {@link Rooms.join} once the rooms are being closed. */
@@ -69,6 +91,12 @@ interface Room {
    * into the document yet.
    */
   unconfirmed?: SentState;
+  /** The running reload, see {@link Rooms.reload}. */
+  reloading?: Promise<void>;
+  /** Whether the project must be loaded (again) by the running reload. */
+  reloadRequested: boolean;
+  /** Ends the wait before the reload's next attempt, e.g. when the room is dropped. */
+  wakeReload?: () => void;
 }
 
 /**
@@ -88,6 +116,9 @@ interface Room {
  * where `setupWSConnection` finds it. Only one server per process may use them.
  */
 export function createRooms({ backend, writeback: timings }: RoomsOptions): Rooms {
+  const definedTimings = Object.fromEntries(
+    Object.entries(timings ?? {}).filter(([, value]) => value !== undefined),
+  ) as Partial<WritebackTimings>;
   const rooms = new Map<string, Room>();
   let closing = false;
 
@@ -103,6 +134,7 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
       isLoaded: false,
       users: 0,
       dropped: false,
+      reloadRequested: false,
     };
     room.loaded = backend
       .getProject(projectId)
@@ -192,7 +224,14 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
 
   function dropIfDone(room: Room): void {
     const writeback = room.writeback;
-    if (room.users === 0 && room.isLoaded && writeback && !writeback.busy && !writeback.hasChanges) {
+    if (
+      room.users === 0 &&
+      room.isLoaded &&
+      room.reloading === undefined &&
+      writeback &&
+      !writeback.busy &&
+      !writeback.hasChanges
+    ) {
       drop(room);
     }
   }
@@ -202,6 +241,7 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
       return;
     }
     room.dropped = true;
+    room.wakeReload?.();
     room.writeback?.dispose();
     if (rooms.get(room.name) === room) {
       rooms.delete(room.name);
@@ -212,7 +252,89 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
     room.doc.destroy();
   }
 
+  /** Reloads the room's project as long as that is requested; see {@link Rooms.reload}. */
+  async function runReload(room: Room): Promise<void> {
+    try {
+      await room.loaded;
+    } catch {
+      room.reloading = undefined;
+      return; // the room was dropped without ever being written back
+    }
+    const writeback = room.writeback as Writeback;
+    while (room.reloadRequested && !room.dropped) {
+      room.reloadRequested = false;
+      await writeback.pause();
+      const project = await loadAgain(room);
+      if (project === undefined) {
+        break; // the room was dropped or nobody uses it anymore
+      }
+      const skipped = applyProject(room.doc, project);
+      if (skipped.length > 0) {
+        console.error(
+          `Left out layout entries of ${room.name} that can't be stored: ${skipped.join(', ')}`,
+        );
+      }
+      room.known = project;
+      room.unconfirmed = undefined;
+    }
+    room.reloading = undefined;
+    if (!room.dropped) {
+      // The document has the backend's state now, or nobody uses it and it is dropped next.
+      writeback.resume({ discardChanges: true });
+      dropIfDone(room);
+    }
+  }
+
+  /**
+   * Loads the room's project, retrying with a growing delay until that succeeds. Returns
+   * `undefined` instead once the room is dropped or nobody uses it anymore: then the backend's
+   * state is loaded fresh when the next user joins.
+   */
+  async function loadAgain(room: Room): Promise<ProjectDetails | undefined> {
+    const { minRetryDelayMs, maxRetryDelayMs } = { ...DEFAULT_WRITEBACK_TIMINGS, ...definedTimings };
+    for (let failures = 0; ; failures += 1) {
+      if (room.dropped || room.users === 0) {
+        return undefined;
+      }
+      try {
+        const project = await backend.getProject(room.projectId);
+        return room.dropped ? undefined : project;
+      } catch (error) {
+        if (room.dropped) {
+          return undefined;
+        }
+        const delay = Math.min(minRetryDelayMs * 2 ** failures, maxRetryDelayMs);
+        console.error(`Reloading ${room.name} failed, trying again in ${delay} ms: ${describeError(error)}`);
+        setWritebackError(
+          room.doc,
+          'Changes made outside this document could not be loaded yet, so nothing is saved until ' +
+            `they are: ${reasonForUsers(error)}`,
+        );
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, delay);
+          room.wakeReload = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+        });
+        room.wakeReload = undefined;
+      }
+    }
+  }
+
   return {
+    reload(roomName) {
+      const room = rooms.get(roomName);
+      if (room === undefined || room.dropped) {
+        return Promise.resolve();
+      }
+      // Right away, so that no writeback starts after the backend's notification.
+      void room.writeback?.pause();
+      room.reloadRequested = true;
+      room.reloading ??= runReload(room);
+      return room.reloading;
+    },
+
     async join(roomName, projectId) {
       if (closing) {
         throw new RoomsClosedError();

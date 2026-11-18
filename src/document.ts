@@ -24,6 +24,9 @@ import type { Map as YMap, Text as YText } from 'yjs';
  * - Soft-deleted elements stay in the document but are not written back, so the backend deletes
  *   them. Restoring one after the writeback creates it again with a new backend ID.
  * - Only the server writes `status` and `backendId`.
+ * - When the backend changes a project outside the document (e.g. a version restore), the server
+ *   applies the differences to the document as one change. The backend wins: changes not written
+ *   back yet are dropped. Elements, fields and descriptions that didn't change stay as they are.
  * - The server writes back what it can read. A new element it can't read (e.g. a relation whose
  *   `sourceId` is the string `"2"`) is left out. If the backend already has such an element,
  *   nothing is written back and `status.writebackError` names it, since leaving it out would

@@ -3,6 +3,7 @@ import type { Doc, Map as YMap } from 'yjs';
 import type { ProjectDetails } from '../src/backend.js';
 import {
   applyBackendState,
+  applyProject,
   DocumentError,
   fillDocument,
   SERVER_ORIGIN,
@@ -988,5 +989,165 @@ describe('mappings and relations that are not finished yet', () => {
     expect(unnamed.toJSON()).toMatchObject({ backendId: 1000, name: 'file-75' });
     expect(named.get('backendId')).toBe(1001);
     expect(backend.changes).toEqual(['create view 1000', 'create view 1001']);
+  });
+});
+
+describe('reloading a project', () => {
+  /** The project as the fake backend stores it, to change it outside the document. */
+  const stored = () => backend.projects.get('12') as StoredProject;
+
+  /** Loads the project again, after it was changed outside the document. */
+  async function reload(): Promise<string[]> {
+    project = await backend.getProject('12');
+    return applyProject(doc, project);
+  }
+
+  /** The document a project loaded from scratch would have. */
+  function loadedFresh(): unknown {
+    const fresh = new Y.Doc();
+    fillDocument(fresh, project);
+    return fresh.toJSON();
+  }
+
+  it('removes, changes and adds what changed outside the document', async () => {
+    const project12 = stored();
+    project12.metaModels = [
+      { id: 101, sourceId: 1, name: 'Vehicle' },
+      { id: 102, sourceId: 2, name: 'Brake' },
+      { id: 104, sourceId: 4, name: 'Tire' },
+    ];
+    project12.relations = [
+      { id: 7, sourceId: 1, targetId: 2, reactionFileStorageId: 51, fineGranularMetaModelRelationSet: [] },
+      { id: 9, sourceId: 1, targetId: 4, reactionFileStorageId: 52, fineGranularMetaModelRelationSet: [] },
+    ];
+    project12.views = [
+      { id: 20, name: 'All', description: 'Everything', fileStorageId: 70, metaModelIds: [1] },
+      { id: 22, name: 'Tires', description: null, fileStorageId: 72, metaModelIds: [4] },
+    ];
+    project12.layout = { metaModels: { '1': { x: 0, y: 0 }, '4': { x: 5, y: 5 } }, reactions: {}, grid: true };
+
+    await reload();
+
+    expect(doc.toJSON()).toEqual(loadedFresh());
+  });
+
+  it('changes only what differs and keeps the rest as it is', async () => {
+    const brake = models().get('2');
+    const overview = views().get('20');
+    const description = overview?.get('description');
+    const changed: string[] = [];
+    doc.on('afterTransaction', (transaction) => {
+      for (const [type, keys] of transaction.changed) {
+        changed.push(...[...keys].map((key) => `${String(type._item?.parentSub ?? 'top')}.${key}`));
+      }
+    });
+    stored().metaModels[0].name = 'Vehicle';
+    stored().views[0].description = 'All parts and more';
+
+    await reload();
+
+    expect(models().get('2')).toBe(brake);
+    expect(views().get('20')).toBe(overview);
+    expect(overview?.get('description')).toBe(description);
+    expect(String(description)).toBe('All parts and more');
+    expect(changed.sort()).toEqual(['1.name', 'description.null']);
+  });
+
+  it('is one change with the server origin', async () => {
+    const origins: unknown[] = [];
+    doc.on('update', (_update: Uint8Array, origin: unknown) => origins.push(origin));
+    stored().metaModels[0].name = 'Vehicle';
+
+    await reload();
+
+    expect(origins).toEqual([SERVER_ORIGIN]);
+  });
+
+  it('changes nothing if the document has the backend state', async () => {
+    const origins: unknown[] = [];
+    doc.on('update', (_update: Uint8Array, origin: unknown) => origins.push(origin));
+
+    await reload();
+
+    expect(origins).toEqual([]);
+  });
+
+  it('drops changes made in the document since the last writeback: the backend wins', async () => {
+    models().get('2')?.set('name', 'Disc brake');
+    models().get('3')?.set('softDeleted', true);
+    relations().get('7')?.set('softDeleted', true);
+    relations().get('8')?.set('fineGranular', []);
+    add(relations(), 'new-relation', { backendId: null, sourceId: 1, targetId: 3, reactionFileId: 55, fineGranular: [] });
+    (views().get('20')?.get('description') as { insert(index: number, text: string): void }).insert(0, 'Not ');
+    views().get('21')?.set('metaModelIds', [3]);
+    add(views(), 'new-view', { backendId: null, name: 'New', description: new Y.Text(), fileStorageId: 73, metaModelIds: [] });
+    (doc.getMap('layout').get('metaModels') as YMap<unknown>).set('2', { x: 1, y: 1 });
+    doc.getMap('layout').delete('zoom');
+
+    await reload();
+
+    expect(doc.toJSON()).toEqual(loadedFresh());
+  });
+
+  it('finds an element by its backend ID also if it is keyed by a UUID', async () => {
+    const view = add(views(), 'new-view', {
+      backendId: null,
+      name: 'Brakes only',
+      description: new Y.Text(),
+      fileStorageId: 73,
+      metaModelIds: [2],
+    });
+    await writeBack();
+    const viewId = view.get('backendId') as number;
+    stored().views.find((candidate) => candidate.id === viewId)!.name = 'Only brakes';
+
+    await reload();
+
+    expect(views().get('new-view')).toBe(view);
+    expect(view.get('name')).toBe('Only brakes');
+    expect([...views().keys()].sort()).toEqual(['20', '21', 'new-view']);
+  });
+
+  it('replaces what the server cannot read with the backend state', async () => {
+    relations().set('7', 'broken' as unknown as YMap<unknown>);
+    views().get('20')?.set('description', 'plain text');
+    doc.getMap('layout').set('metaModels', 5);
+
+    await reload();
+
+    expect(doc.toJSON()).toEqual(loadedFresh());
+    expect(relations().get('7')).toBeInstanceOf(Y.Map);
+    expect(views().get('20')?.get('description')).toBeInstanceOf(Y.Text);
+    expect(doc.getMap('layout').get('metaModels')).toBeInstanceOf(Y.Map);
+  });
+
+  it('clears the writeback error and keeps the rest of the status', async () => {
+    setWritebackError(doc, 'The changes could not be saved');
+    doc.getMap('status').set('epoch', 'e-1');
+
+    await reload();
+
+    expect(doc.getMap('status').toJSON()).toEqual({ writebackError: null, epoch: 'e-1' });
+  });
+
+  it('leaves out layout entries Yjs cannot store and reports them', async () => {
+    stored().layout = { metaModels: { '1': { x: 1, y: 2 }, '2': { constructor: 'x' } }, note: { constructor: 'y' } };
+
+    const skipped = await reload();
+
+    expect(skipped).toEqual(['note', 'metaModels.2']);
+    expect(doc.getMap('layout').toJSON()).toEqual({ metaModels: { '1': { x: 1, y: 2 } }, reactions: {} });
+  });
+
+  it('leads to a writeback that changes nothing in the backend', async () => {
+    stored().metaModels[1].name = 'Disc brake';
+    stored().views[1].description = 'Nothing yet';
+    models().get('1')?.set('name', 'Automobile');
+    add(relations(), 'new-relation', { backendId: null, sourceId: 1, targetId: 3, reactionFileId: 55, fineGranular: [] });
+    await reload();
+
+    await backend.syncChanges('12', toSyncChanges(doc, project).changes);
+
+    expect(backend.changes).toEqual([]);
   });
 });
