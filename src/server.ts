@@ -2,20 +2,46 @@ import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse }
 import type { AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer } from 'ws';
-import { setupWSConnection } from 'y-websocket/bin/utils';
+import { setPersistence, setupWSConnection } from 'y-websocket/bin/utils';
 import { AccessError, fetchRole, parseRoomName, type BackendOptions, type Role } from './access.js';
+import { BackendError, type BackendClient } from './backend.js';
+import { describeError } from './errors.js';
 import { makeReadOnly } from './readOnly.js';
+import { createRooms, RoomsClosedError, type JoinedRoom } from './rooms.js';
+import type { WritebackTimings } from './writeback.js';
+
+/**
+ * How long shutting down waits for the last writebacks. Docker kills a container 10 seconds after
+ * asking it to stop.
+ */
+export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 8000;
+
+/** Largest message a client may send. */
+export const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+
+export interface CollaborationServerOptions extends BackendOptions {
+  /** Client of the backend's internal endpoints, which loads projects and writes changes back. */
+  backend: BackendClient;
+  /** Defaults to {@link DEFAULT_WRITEBACK_TIMINGS}. */
+  writeback?: Partial<WritebackTimings>;
+  /** Defaults to {@link DEFAULT_SHUTDOWN_TIMEOUT_MS}. */
+  shutdownTimeoutMs?: number;
+}
 
 export interface CollaborationServer {
   /** Starts listening. Resolves with the port, which is useful with port `0` in tests. */
   listen(port: number): Promise<number>;
-  /** Disconnects all clients and stops the server. */
+  /**
+   * Stops accepting connections, disconnects all clients, writes their changes back and stops.
+   * Later calls return the same promise.
+   */
   close(): Promise<void>;
 }
 
 /** The room a connection may join and the role of its user there. */
 interface Access {
   roomName: string;
+  projectId: string;
   role: Role;
 }
 
@@ -25,40 +51,111 @@ interface Access {
  * - `GET /health` answers `200` so Docker and monitoring can check that the server runs.
  * - WebSocket connections join the room named by the URL path and pass the user's access token as
  *   a query parameter, e.g. `ws://host:1234/vsum:12?token=...` joins `vsum:12`. Everyone in a room
- *   shares one Yjs document, which is kept in memory.
+ *   shares one Yjs document.
  * - Before a connection is accepted, the backend is asked for the user's role in the project.
  *   Users without access are rejected, and viewers can read but not change the document.
+ * - The first connection to a room loads the project into the document; the connection is accepted
+ *   once that is done. The users' changes are written back to the backend (see `rooms.ts`).
+ *
+ * Only one server per process: rooms are kept in y-websocket's module-wide `docs` map.
  */
-export function createCollaborationServer(options: BackendOptions): CollaborationServer {
-  const webSockets = new WebSocketServer({ noServer: true });
+export function createCollaborationServer(options: CollaborationServerOptions): CollaborationServer {
+  // Documents are loaded and written back by the rooms; y-websocket must neither store them (as it
+  // would with YPERSISTENCE set) nor drop them when the last user leaves.
+  setPersistence(null);
+  const rooms = createRooms({ backend: options.backend, writeback: options.writeback });
+  // A project's document is small; ws would accept messages of up to 100 MiB.
+  const webSockets = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_BYTES });
   /** Connections that wait for the backend's answer and are not WebSocket connections yet. */
   const waiting = new Set<Duplex>();
+  let closing = false;
 
   const httpServer = createServer(handleHttpRequest);
-  httpServer.on('upgrade', (request, socket, head) => {
+  httpServer.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     // Without a listener, a connection error while waiting for the backend would crash the server.
     socket.on('error', () => socket.destroy());
+    if (closing) {
+      reject(socket, new AccessError(503, 'The server is shutting down'));
+      return;
+    }
     waiting.add(socket);
-    checkAccess(request, options).then(
-      ({ roomName, role }) => {
-        waiting.delete(socket);
-        if (socket.destroyed) {
-          return;
-        }
-        webSockets.handleUpgrade(request, socket, head, (webSocket) => {
-          // The role is checked once per connection, so it stays the same until the client reconnects.
-          if (role === 'VIEWER') {
-            makeReadOnly(webSocket);
-          }
-          setupWSConnection(webSocket, request, { docName: roomName });
-        });
-      },
+    connect(request, socket, head).then(
+      () => waiting.delete(socket),
       (error: unknown) => {
         waiting.delete(socket);
         reject(socket, error);
       },
     );
   });
+
+  async function connect(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+    const { roomName, projectId, role } = await checkAccess(request, options);
+    const room = await joinRoom(roomName, projectId);
+    // The raw socket closes in every case: when the WebSocket closes, and also when the upgrade
+    // below is aborted without ever creating one (e.g. the client went away while loading).
+    socket.once('close', room.release);
+    if (socket.destroyed) {
+      room.release();
+      return;
+    }
+    if (closing) {
+      room.release();
+      throw new AccessError(503, 'The server is shutting down');
+    }
+    webSockets.handleUpgrade(request, socket, head, (webSocket) => {
+      // ws reports invalid frames as errors and then closes the connection. Without a listener, the
+      // error would crash the server. Only the message is logged: the request URL has the token.
+      webSocket.on('error', (error) => {
+        console.error(`A connection to ${roomName} failed:`, error.message);
+      });
+      // The role is checked once per connection, so it stays the same until the client reconnects.
+      if (role === 'VIEWER') {
+        makeReadOnly(webSocket);
+      }
+      setupWSConnection(webSocket, request, { docName: roomName });
+    });
+  }
+
+  async function joinRoom(roomName: string, projectId: string): Promise<JoinedRoom> {
+    try {
+      return await rooms.join(roomName, projectId);
+    } catch (error) {
+      if (error instanceof RoomsClosedError) {
+        throw new AccessError(503, error.message);
+      }
+      if (error instanceof BackendError && error.status === 404) {
+        throw new AccessError(403, 'The project does not exist');
+      }
+      throw new AccessError(503, `The project could not be loaded: ${describeError(error)}`);
+    }
+  }
+
+  let stopping: Promise<void> | undefined;
+
+  /** Stops the server; see {@link CollaborationServer.close}. */
+  async function stop(): Promise<void> {
+    closing = true;
+    // Stop accepting connections first, so that disconnected clients can't come back meanwhile.
+    const stopped = new Promise<void>((resolve, reject) =>
+      httpServer.close((error) => (error ? reject(error) : resolve())),
+    );
+    // Awaited below; without a handler meanwhile, an early failure would be an unhandled rejection.
+    stopped.catch(() => {});
+    for (const socket of waiting) {
+      socket.destroy();
+    }
+    for (const client of webSockets.clients) {
+      client.terminate();
+    }
+    try {
+      await rooms.closeAll(options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS);
+    } finally {
+      webSockets.close();
+      // Upgraded connections would keep the HTTP server open.
+      httpServer.closeAllConnections();
+      await stopped;
+    }
+  }
 
   return {
     listen: (port) =>
@@ -69,19 +166,11 @@ export function createCollaborationServer(options: BackendOptions): Collaboratio
           resolve((httpServer.address() as AddressInfo).port);
         });
       }),
-    close: () =>
-      new Promise((resolve, reject) => {
-        // Upgraded connections would keep the HTTP server open, so end them first.
-        for (const socket of waiting) {
-          socket.destroy();
-        }
-        for (const client of webSockets.clients) {
-          client.terminate();
-        }
-        webSockets.close();
-        httpServer.close((error) => (error ? reject(error) : resolve()));
-        httpServer.closeAllConnections();
-      }),
+    close: () => {
+      // A second call (e.g. SIGINT after SIGTERM) waits for the first instead of closing again.
+      stopping ??= stop();
+      return stopping;
+    },
   };
 }
 
@@ -101,7 +190,7 @@ async function checkAccess(request: IncomingMessage, options: BackendOptions): P
     throw new AccessError(400, 'The request URL is invalid');
   }
   const projectId = parseRoomName(roomName);
-  return { roomName, role: await fetchRole(projectId, token, options) };
+  return { roomName, projectId, role: await fetchRole(projectId, token, options) };
 }
 
 /** Answers the upgrade request with an HTTP error instead of opening a WebSocket connection. */

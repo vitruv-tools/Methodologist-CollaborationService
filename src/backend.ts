@@ -4,37 +4,104 @@ import type { ServiceToken } from './serviceToken.js';
 /** How long a request to an internal endpoint may take. Writing changes back can take a while. */
 export const DEFAULT_INTERNAL_TIMEOUT_MS = 30_000;
 
+/** A metamodel of a project, or one a view uses (`MetaModelResponse`). */
+export interface MetaModelDetails {
+  /** ID of the project's own copy of the metamodel. */
+  id: number;
+  /** ID of the metamodel in the model library that the copy was made from. Sync requests use it. */
+  sourceId?: number | null;
+  /** Name of the metamodel in the project. */
+  name?: string | null;
+  [field: string]: unknown;
+}
+
 /**
- * A project as the backend returns it (`VsumMetaModelResponse`). Only the top level is typed; the
- * issue that loads projects into the shared document types the rest.
+ * An element-level mapping under a relation (`FineGranularMetaModelRelationResponse`). The request
+ * (`FineGranularMetaModelRelationRequest`) has the same fields, so these are sent back as they are.
  */
+export interface FineGranularDetails {
+  id?: number | null;
+  sourceId?: string | null;
+  targetId?: string | null;
+  reactionFileStorageId?: number | null;
+  lowCodeReactionRequestBase?: unknown;
+  [field: string]: unknown;
+}
+
+/** A relation between two metamodels (`MetaModelRelationResponse`), with library metamodel IDs. */
+export interface RelationDetails {
+  id: number;
+  sourceId: number;
+  targetId: number;
+  reactionFileStorageId?: number | null;
+  fineGranularMetaModelRelationSet?: FineGranularDetails[] | null;
+}
+
+/** A view of a project (`ViewsResponse`). */
+export interface ViewDetails {
+  id: number;
+  name?: string | null;
+  description?: string | null;
+  fileStorageId?: number | null;
+  assignedModels?: MetaModelDetails[] | null;
+  [field: string]: unknown;
+}
+
+/** A project as the backend returns it (`VsumMetaModelResponse`). */
 export interface ProjectDetails {
   id: number;
   name: string;
-  metaModels?: unknown[];
-  metaModelsRelation?: unknown[];
-  views?: unknown[];
+  metaModels?: MetaModelDetails[] | null;
+  metaModelsRelation?: RelationDetails[] | null;
+  views?: ViewDetails[] | null;
+  /** The canvas positions, stored by the backend without interpreting them; `null` if none. */
   layout?: unknown;
   [field: string]: unknown;
 }
 
-/** The desired state of a project, as the backend expects it (`VsumSyncChangesPutRequest`). */
+/** A relation in a sync request (`MetaModelRelationRequest`). */
+export interface RelationRequest {
+  sourceId: number;
+  targetId: number;
+  reactionFileId: number | null;
+  fineGranularMetaModelRelationSet: FineGranularDetails[];
+}
+
+/** A view in a sync request (`ViewRequest`). */
+export interface ViewRequest {
+  /** ID of the existing view. Without it, the backend finds the view by its name. */
+  id?: number;
+  name: string;
+  description: string;
+  fileStorageId: number | null;
+  metaModelIds: number[];
+}
+
+/**
+ * The desired state of a project, as the backend expects it (`VsumSyncChangesPutRequest`). The
+ * backend deletes what the request doesn't contain, except the layout: without one, it keeps the
+ * stored layout.
+ */
 export interface SyncChanges {
-  metaModelIds?: number[];
-  metaModelNames?: Record<string, string>;
-  metaModelRelationRequests?: unknown[];
-  viewRequests?: unknown[];
-  layout?: unknown;
+  /** Library IDs of the project's metamodels. */
+  metaModelIds: number[];
+  /** Names of the metamodels in the project, by library ID. */
+  metaModelNames: Record<string, string>;
+  metaModelRelationRequests: RelationRequest[];
+  viewRequests: ViewRequest[];
+  layout?: Record<string, unknown>;
 }
 
 /**
  * Why a request to the backend failed. `status` is the backend's HTTP status, or `undefined` if
- * the backend didn't answer. The message never contains a token.
+ * the backend didn't answer. `detail` is the `message` of the backend's error answer, if it has
+ * one, e.g. why a sync request is invalid. Neither contains a token.
  */
 export class BackendError extends Error {
   constructor(
     readonly status: number | undefined,
     message: string,
+    readonly detail?: string,
   ) {
     super(message);
     this.name = 'BackendError';
@@ -86,6 +153,7 @@ export function createBackendClient(options: BackendClientOptions): BackendClien
       throw new BackendError(
         response.status,
         `The backend answered ${method} ${path} with status ${response.status}`,
+        response.detail,
       );
     }
     return response.body;
@@ -109,11 +177,16 @@ export function createBackendClient(options: BackendClientOptions): BackendClien
   };
 }
 
+/** Longest `detail` taken from an error answer; the rest is cut off. */
+const MAX_DETAIL_LENGTH = 500;
+
 interface Answer {
   status: number;
   ok: boolean;
   /** Parsed JSON body of a successful answer; `undefined` if it has none. */
   body: unknown;
+  /** The `message` of an error answer, if it has one. */
+  detail?: string;
 }
 
 async function request(
@@ -123,6 +196,8 @@ async function request(
   body: unknown,
   timeoutMs: number,
 ): Promise<Answer> {
+  // Outside the try: a body that isn't JSON is a mistake of the caller, not an unavailable backend.
+  const payload = body === undefined ? undefined : JSON.stringify(body);
   try {
     const response = await fetch(url, {
       method,
@@ -131,18 +206,28 @@ async function request(
         Accept: 'application/json',
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: payload,
       // Never follow a redirect: it would send the token to another address.
       redirect: 'manual',
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) {
-      await response.body?.cancel();
-      return { status: response.status, ok: false, body: undefined };
+      const error: unknown = await response.json().catch(() => undefined);
+      return { status: response.status, ok: false, body: undefined, detail: errorMessage(error) };
     }
     const json: unknown = await response.json().catch(() => undefined);
     return { status: response.status, ok: true, body: json };
   } catch (error) {
     throw new BackendError(undefined, `The backend is not available: ${describeError(error)}`);
   }
+}
+
+/** Returns the `message` of the backend's error answer (`ErrorResponse`), if it has one. */
+function errorMessage(body: unknown): string | undefined {
+  const message = (body as { message?: unknown } | null | undefined)?.message;
+  if (typeof message !== 'string' || message.trim() === '') {
+    return undefined;
+  }
+  const trimmed = message.trim();
+  return trimmed.length > MAX_DETAIL_LENGTH ? `${trimmed.slice(0, MAX_DETAIL_LENGTH)}…` : trimmed;
 }
