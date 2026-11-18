@@ -1,5 +1,7 @@
+import { createBackendClient } from './backend.js';
 import { loadConfig, type Config } from './config.js';
 import { createCollaborationServer } from './server.js';
+import { createServiceToken } from './serviceToken.js';
 
 let config: Config;
 try {
@@ -9,14 +11,19 @@ try {
   process.exit(1);
 }
 
-const server = createCollaborationServer({ backendUrl: config.backendUrl });
+const backend = createBackendClient({
+  backendUrl: config.backendUrl,
+  serviceToken: createServiceToken(config.keycloak),
+});
+const server = createCollaborationServer({ backendUrl: config.backendUrl, backend });
 
 const port = await server.listen(config.port);
 console.log(`Collaboration server listening on port ${port}, backend at ${config.backendUrl}`);
 
-// Docker stops containers with SIGTERM: disconnect the clients and exit instead of waiting to be killed.
+// Docker stops containers with SIGTERM: write the changes back and exit instead of waiting to be
+// killed. A second signal (e.g. pressing Ctrl+C twice) waits for the same shutdown.
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
-  process.once(signal, () => {
+  process.on(signal, () => {
     console.log(`Received ${signal}, shutting down`);
     server.close().then(
       () => process.exit(0),

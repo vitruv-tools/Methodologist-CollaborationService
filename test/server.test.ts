@@ -1,9 +1,17 @@
+import { connect as connectTcp } from 'node:net';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { WebsocketProvider } from 'y-websocket';
+import { docs, setPersistence } from 'y-websocket/bin/utils';
 import * as Y from 'yjs';
-import { createCollaborationServer, type CollaborationServer } from '../src/server.js';
+import { BackendError } from '../src/backend.js';
+import {
+  createCollaborationServer,
+  MAX_MESSAGE_BYTES,
+  type CollaborationServer,
+} from '../src/server.js';
 import { details, startFakeBackend, type FakeAnswer, type FakeBackend } from './fakeBackend.js';
+import { FakeProjects, gate } from './fakeProjects.js';
 
 /**
  * The fake backend knows these tokens. `owner`, `member` and `viewer` have that role in every
@@ -32,7 +40,12 @@ function answer(token: string | undefined, projectId: string): FakeAnswer {
   }
 }
 
+/** Short delays, so that tests don't wait 5 seconds for a writeback. */
+const TIMINGS = { debounceMs: 20, maxWaitMs: 200, minRetryDelayMs: 10, maxRetryDelayMs: 40 };
+
 let backend: FakeBackend;
+/** The backend's internal endpoints, which projects are loaded from and written back to. */
+let projects: FakeProjects;
 let server: CollaborationServer;
 let httpUrl: string;
 let wsUrl: string;
@@ -40,7 +53,13 @@ const providers: WebsocketProvider[] = [];
 
 beforeAll(async () => {
   backend = await startFakeBackend(answer);
-  server = createCollaborationServer({ backendUrl: backend.url, backendTimeoutMs: 300 });
+  projects = new FakeProjects();
+  server = createCollaborationServer({
+    backendUrl: backend.url,
+    backendTimeoutMs: 300,
+    backend: projects,
+    writeback: TIMINGS,
+  });
   const port = await server.listen(0);
   httpUrl = `http://localhost:${port}`;
   wsUrl = `ws://localhost:${port}`;
@@ -62,10 +81,16 @@ afterAll(async () => {
 
 /**
  * Connects a new client to the given room and waits until it is synced. The client starts with
- * `doc` if given, otherwise with an empty document.
+ * `doc` if given, otherwise with an empty document. `url` is the server's, by default the one all
+ * tests share.
  */
-async function connect(room: string, token: string, doc = new Y.Doc()): Promise<WebsocketProvider> {
-  const provider = new WebsocketProvider(wsUrl, room, doc, {
+async function connect(
+  room: string,
+  token: string,
+  doc = new Y.Doc(),
+  url = wsUrl,
+): Promise<WebsocketProvider> {
+  const provider = new WebsocketProvider(url, room, doc, {
     WebSocketPolyfill: WebSocket as unknown as typeof globalThis.WebSocket,
     // Clients in one process would otherwise sync through a BroadcastChannel, bypassing the server.
     disableBc: true,
@@ -216,7 +241,7 @@ describe('access', () => {
     await expect(rejectionStatus('/vsum:404?token=owner')).resolves.toBe(403);
   });
 
-  it.each(['/', '/vsum', '/vsum:', '/vsum:abc', '/vsum:1a', '/vsum:-1', '/vsum:1/x', '/room:1', '/%'])(
+  it.each(['/', '/vsum', '/vsum:', '/vsum:abc', '/vsum:1a', '/vsum:-1', '/vsum:012', '/vsum:1000000000000000000', '/vsum:1/x', '/room:1', '/%'])(
     'rejects the invalid room name %s with 400 without asking the backend',
     async (path) => {
       backend.requests.length = 0;
@@ -240,7 +265,7 @@ describe('access', () => {
   it('rejects with 503 if the backend is not reachable', async () => {
     const stopped = await startFakeBackend(answer);
     await stopped.close();
-    const lonelyServer = createCollaborationServer({ backendUrl: stopped.url });
+    const lonelyServer = createCollaborationServer({ backendUrl: stopped.url, backend: projects });
     const port = await lonelyServer.listen(0);
     try {
       const status = await new Promise((resolve, reject) => {
@@ -313,5 +338,358 @@ describe('viewers', () => {
     expect(owner.doc.getMap('test').has('fromViewer')).toBe(false);
     const late = await connect('vsum:23', 'member');
     expect(late.doc.getMap('test').has('fromViewer')).toBe(false);
+  });
+});
+
+/** Resolves once `condition` holds for the client's document, i.e. once a change arrived. */
+function arrives(doc: Y.Doc, condition: () => boolean): Promise<void> {
+  return new Promise((resolve) => {
+    if (condition()) {
+      resolve();
+      return;
+    }
+    const onUpdate = () => {
+      if (condition()) {
+        doc.off('update', onUpdate);
+        resolve();
+      }
+    };
+    doc.on('update', onUpdate);
+  });
+}
+
+/** The server's document of a room as JSON, `undefined` if the room isn't open. */
+function serverDoc(room: string): Record<string, unknown> | undefined {
+  return docs.get(room)?.toJSON();
+}
+
+/** The name the backend stores for metamodel 1 of a project. */
+const storedName = (projectId: string) => projects.projects.get(projectId)?.metaModels[0]?.name;
+
+/** Starts a second server whose writebacks only happen when the last user leaves or on shutdown. */
+async function startServerWithoutDelayedWritebacks(): Promise<{
+  server: CollaborationServer;
+  url: string;
+}> {
+  const other = createCollaborationServer({
+    backendUrl: backend.url,
+    backend: projects,
+    writeback: { ...TIMINGS, debounceMs: 60_000, maxWaitMs: 60_000 },
+  });
+  return { server: other, url: `ws://localhost:${await other.listen(0)}` };
+}
+
+describe('projects', () => {
+  it('are loaded when the first user opens them', async () => {
+    projects.add('30', {
+      metaModels: [
+        { id: 101, sourceId: 1, name: 'Car' },
+        { id: 102, sourceId: 2, name: 'Brake' },
+      ],
+      relations: [
+        { id: 7, sourceId: 1, targetId: 2, reactionFileStorageId: 50, fineGranularMetaModelRelationSet: [] },
+      ],
+      views: [{ id: 20, name: 'Overview', description: 'All parts', fileStorageId: 70, metaModelIds: [1] }],
+      layout: { metaModels: { '1': { x: 10, y: 20 } } },
+    });
+
+    const { doc } = await connect('vsum:30', 'viewer');
+
+    expect(doc.getMap('models').toJSON()).toEqual({
+      '1': { name: 'Car', softDeleted: false, softDeletedVia: null },
+      '2': { name: 'Brake', softDeleted: false, softDeletedVia: null },
+    });
+    expect(doc.getMap('relations').toJSON()).toEqual({
+      '7': {
+        backendId: 7,
+        sourceId: 1,
+        targetId: 2,
+        reactionFileId: 50,
+        fineGranular: [],
+        softDeleted: false,
+        softDeletedVia: null,
+      },
+    });
+    expect(doc.getMap('views').toJSON()).toEqual({
+      '20': {
+        backendId: 20,
+        name: 'Overview',
+        description: 'All parts',
+        fileStorageId: 70,
+        metaModelIds: [1],
+        softDeleted: false,
+        softDeletedVia: null,
+      },
+    });
+    expect(doc.getMap('layout').toJSON()).toEqual({ metaModels: { '1': { x: 10, y: 20 } }, reactions: {} });
+  });
+
+  it('get the changes of users written back after a short delay', async () => {
+    projects.add('31', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const { doc } = await connect('vsum:31', 'member');
+
+    (doc.getMap('models').get('1') as Y.Map<unknown>).set('name', 'Vehicle');
+
+    await vi.waitFor(() => expect(storedName('31')).toBe('Vehicle'));
+  });
+
+  it('create a new view once, and every user gets its backend ID', async () => {
+    projects.add('32', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const alice = await connect('vsum:32', 'owner');
+    const bob = await connect('vsum:32', 'member');
+    const view = new Y.Map<unknown>(
+      Object.entries({
+        backendId: null,
+        name: 'Overview',
+        description: new Y.Text('All parts'),
+        fileStorageId: 70,
+        metaModelIds: [1],
+        softDeleted: false,
+        softDeletedVia: null,
+      }),
+    );
+
+    alice.doc.getMap('views').set('3f1c-new', view);
+
+    const backendIdAtBob = () =>
+      (bob.doc.getMap('views').get('3f1c-new') as Y.Map<unknown> | undefined)?.get('backendId');
+    await arrives(bob.doc, () => backendIdAtBob() === 1000);
+    (alice.doc.getMap('views').get('3f1c-new') as Y.Map<unknown>).set('name', 'All parts');
+    await vi.waitFor(() =>
+      expect(projects.projects.get('32')?.views).toMatchObject([{ id: 1000, name: 'All parts' }]),
+    );
+    expect(projects.changes.filter((change) => change.includes('view'))).toEqual([
+      'create view 1000',
+      'update view 1000',
+    ]);
+  });
+
+  it('report a rejected writeback to every user in status', async () => {
+    projects.add('33', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    projects.nextSyncs.push(new BackendError(400, 'status 400', 'View names must be unique'));
+    const alice = await connect('vsum:33', 'owner');
+    const viewer = await connect('vsum:33', 'viewer');
+
+    (alice.doc.getMap('models').get('1') as Y.Map<unknown>).set('name', 'Vehicle');
+
+    const error = () => viewer.doc.getMap('status').get('writebackError');
+    await arrives(viewer.doc, () => typeof error() === 'string');
+    expect(error()).toBe('The changes could not be saved: View names must be unique');
+  });
+
+  it("are not written back for a viewer's attempted change", async () => {
+    projects.add('34', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const viewer = await connect('vsum:34', 'viewer');
+
+    (viewer.doc.getMap('models').get('1') as Y.Map<unknown>).set('name', 'Hack');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(projects.requests.filter((request) => request.projectId === '34')).toEqual([]);
+  });
+
+  it('are written back when the last user leaves', async () => {
+    projects.add('35', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const other = await startServerWithoutDelayedWritebacks();
+    try {
+      const provider = await connect('vsum:35', 'owner', new Y.Doc(), other.url);
+      (provider.doc.getMap('models').get('1') as Y.Map<unknown>).set('name', 'Vehicle');
+      await vi.waitFor(() => expect(JSON.stringify(serverDoc('vsum:35'))).toContain('Vehicle'));
+      expect(storedName('35')).toBe('Car');
+
+      provider.destroy();
+
+      await vi.waitFor(() => expect(storedName('35')).toBe('Vehicle'));
+      await vi.waitFor(() => expect(docs.has('vsum:35')).toBe(false));
+    } finally {
+      await other.server.close();
+    }
+  });
+
+  it('are written back when the server shuts down', async () => {
+    projects.add('36', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const other = await startServerWithoutDelayedWritebacks();
+    const provider = await connect('vsum:36', 'owner', new Y.Doc(), other.url);
+    (provider.doc.getMap('models').get('1') as Y.Map<unknown>).set('name', 'Vehicle');
+    await vi.waitFor(() => expect(JSON.stringify(serverDoc('vsum:36'))).toContain('Vehicle'));
+
+    await other.server.close();
+    provider.destroy();
+
+    expect(storedName('36')).toBe('Vehicle');
+    expect(docs.has('vsum:36')).toBe(false);
+  });
+
+  it('are not opened, and never written back, if loading fails', async () => {
+    projects.nextLoads.push(new BackendError(500, 'status 500'));
+
+    await expect(rejectionStatus('/vsum:37?token=owner')).resolves.toBe(503);
+
+    expect(docs.has('vsum:37')).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(projects.requests.filter((request) => request.projectId === '37')).toEqual([]);
+  });
+
+  it('that the backend does not have are rejected with 403', async () => {
+    projects.missing.add('38');
+
+    await expect(rejectionStatus('/vsum:38?token=owner')).resolves.toBe(403);
+  });
+
+  it('are closed again when the only client went away while they were loading', async () => {
+    const loading = gate();
+    projects.nextLoads.push(loading.interruption);
+    const socket = connectTcp(Number(new URL(wsUrl).port), 'localhost');
+    await new Promise<void>((resolve) => socket.once('connect', () => resolve()));
+    socket.write(
+      'GET /vsum:39?token=owner HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n' +
+        'Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n' +
+        'Sec-WebSocket-Version: 13\r\n\r\n',
+    );
+    await vi.waitFor(() => expect(projects.loads).toContain('39'));
+
+    // Only half-closes the connection, so the server's socket isn't destroyed yet.
+    socket.end();
+    loading.open();
+
+    await vi.waitFor(() => expect(docs.has('vsum:39')).toBe(false));
+    socket.destroy();
+  });
+});
+
+describe('robustness', () => {
+  it('survives a malformed frame and logs it without the token', async () => {
+    projects.add('50', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const socket = new WebSocket(`${wsUrl}/vsum:50?token=owner`);
+    await new Promise((resolve) => socket.once('open', resolve));
+    const closed = new Promise((resolve) => socket.once('close', resolve));
+    socket.on('error', () => {});
+
+    // A frame with RSV1 set, which ws rejects as invalid.
+    (socket as unknown as { _socket: { write(data: Buffer): void } })._socket.write(
+      Buffer.from([0xc2, 0x80, 1, 2, 3, 4]),
+    );
+    await closed;
+
+    expect((await fetch(`${httpUrl}/health`)).status).toBe(200);
+    const logged = vi.mocked(console.error).mock.calls.map((call) => call.join(' '));
+    expect(logged.some((line) => line.startsWith('A connection to vsum:50 failed:'))).toBe(true);
+    expect(logged.join(' ')).not.toContain('token=');
+  });
+
+  it('closes a connection that sends a message larger than 16 MiB', async () => {
+    projects.add('56', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const socket = new WebSocket(`${wsUrl}/vsum:56?token=owner`);
+    await new Promise((resolve) => socket.once('open', resolve));
+    socket.on('error', () => {});
+    const code = new Promise((resolve) => socket.once('close', resolve));
+
+    socket.send(Buffer.alloc(MAX_MESSAGE_BYTES + 1));
+
+    await expect(code).resolves.toBe(1009); // message too big
+    expect((await fetch(`${httpUrl}/health`)).status).toBe(200);
+  });
+
+  it('closes a room again when its only client reset the connection while it was loading', async () => {
+    const loading = gate();
+    projects.nextLoads.push(loading.interruption);
+    const socket = connectTcp(Number(new URL(wsUrl).port), 'localhost');
+    await new Promise<void>((resolve) => socket.once('connect', () => resolve()));
+    socket.write(
+      'GET /vsum:51?token=owner HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n' +
+        'Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n' +
+        'Sec-WebSocket-Version: 13\r\n\r\n',
+    );
+    await vi.waitFor(() => expect(projects.loads).toContain('51'));
+
+    socket.resetAndDestroy();
+    await new Promise((resolve) => setTimeout(resolve, 50)); // the server notices the reset
+    loading.open();
+
+    await vi.waitFor(() => expect(docs.has('vsum:51')).toBe(false));
+  });
+
+  it('rejects a connection that completes its request while the server shuts down, without asking the backend', async () => {
+    const other = createCollaborationServer({
+      backendUrl: backend.url,
+      backend: projects,
+      writeback: TIMINGS,
+      shutdownTimeoutMs: 1000,
+    });
+    const port = await other.listen(0);
+    // A connection whose project is still loading keeps the server busy shutting down.
+    const loading = gate();
+    projects.nextLoads.push(loading.interruption);
+    const pending = new WebSocket(`ws://localhost:${port}/vsum:52?token=owner`);
+    pending.on('error', () => {});
+    await vi.waitFor(() => expect(projects.loads).toContain('52'));
+    const socket = connectTcp(port, 'localhost');
+    await new Promise<void>((resolve) => socket.once('connect', () => resolve()));
+    const response = new Promise<string>((resolve) => {
+      let data = '';
+      socket.on('data', (chunk) => (data += chunk));
+      socket.on('close', () => resolve(data));
+    });
+    socket.write('GET /vsum:53?token=owner HTTP/1.1\r\nHost: localhost\r\n');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    backend.requests.length = 0;
+
+    const closed = other.close();
+    socket.write(
+      'Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n' +
+        'Sec-WebSocket-Version: 13\r\n\r\n',
+    );
+
+    expect(await response).toMatch(/^HTTP\/1\.1 503 /);
+    expect(backend.requests).toEqual([]);
+    loading.open();
+    await closed;
+  });
+
+  it('waits for the first shutdown when it is asked to shut down again', async () => {
+    projects.add('54', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const other = await startServerWithoutDelayedWritebacks();
+    const provider = await connect('vsum:54', 'owner', new Y.Doc(), other.url);
+    (provider.doc.getMap('models').get('1') as Y.Map<unknown>).set('name', 'Vehicle');
+    await vi.waitFor(() => expect(JSON.stringify(serverDoc('vsum:54'))).toContain('Vehicle'));
+    const saving = gate();
+    projects.nextSyncs.push(saving.interruption);
+
+    const first = other.server.close();
+    const second = other.server.close();
+    saving.open();
+
+    expect(second).toBe(first);
+    await second;
+    provider.destroy();
+    expect(storedName('54')).toBe('Vehicle');
+  });
+
+  it("doesn't let y-websocket store documents, even if a persistence was set", async () => {
+    const bindState = vi.fn();
+    setPersistence({ provider: null, bindState, writeState: async () => {} } as never);
+    const other = createCollaborationServer({ backendUrl: backend.url, backend: projects, writeback: TIMINGS });
+    try {
+      const url = `ws://localhost:${await other.listen(0)}`;
+      projects.add('55', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+
+      await connect('vsum:55', 'owner', new Y.Doc(), url);
+
+      expect(bindState).not.toHaveBeenCalled();
+    } finally {
+      setPersistence(null);
+      await other.close();
+    }
+  });
+});
+
+describe('room names', () => {
+  it.each(['0', '999999999999999999'])('accepts vsum:%s', async (id) => {
+    backend.requests.length = 0;
+
+    await connect(`vsum:${id}`, 'owner');
+
+    expect(backend.requests).toEqual([
+      { path: `/api/v1/vsums/${id}/details`, authorization: 'Bearer owner' },
+    ]);
   });
 });

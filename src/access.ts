@@ -8,8 +8,9 @@ const ROLES: readonly string[] = ['OWNER', 'MEMBER', 'VIEWER'];
 /** How long the backend may take to answer before the connection is rejected with `503`. */
 export const DEFAULT_BACKEND_TIMEOUT_MS = 5000;
 
-// At most 18 digits, so the ID always fits into the backend's `Long`.
-const ROOM_NAME = /^vsum:(\d{1,18})$/;
+// At most 18 digits, so the ID always fits into the backend's `Long`. No leading zeros, so that
+// each project has one room: `vsum:012` would be a second room for project 12.
+const ROOM_NAME = /^vsum:(0|[1-9]\d{0,17})$/;
 
 /** Why a connection is rejected. `status` is the HTTP status the client gets. */
 export class AccessError extends Error {
@@ -30,7 +31,7 @@ export class AccessError extends Error {
 export function parseRoomName(roomName: string): string {
   const match = ROOM_NAME.exec(roomName);
   if (match === null) {
-    throw new AccessError(400, 'The room name must be vsum:{id} with a numeric ID');
+    throw new AccessError(400, 'The room name must be vsum:{id} with a numeric ID without leading zeros');
   }
   return match[1];
 }

@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { BackendError, createBackendClient, type BackendClient } from '../src/backend.js';
+import {
+  BackendError,
+  createBackendClient,
+  type BackendClient,
+  type SyncChanges,
+} from '../src/backend.js';
 import { createServiceToken, ServiceTokenError } from '../src/serviceToken.js';
 import { CLIENT_ID, CLIENT_SECRET, REALM, startFakeKeycloak, type FakeKeycloak } from './fakeKeycloak.js';
 import {
@@ -11,6 +16,12 @@ import {
 } from './fakeServer.js';
 
 const PROJECT = { id: 12, name: 'Project', metaModels: [], metaModelsRelation: [], views: [] };
+const NO_CHANGES: SyncChanges = {
+  metaModelIds: [],
+  metaModelNames: {},
+  metaModelRelationRequests: [],
+  viewRequests: [],
+};
 
 let keycloak: FakeKeycloak;
 let backend: FakeServer;
@@ -69,7 +80,7 @@ describe('internal endpoints', () => {
   });
 
   it('writes changes back with the service token', async () => {
-    const changes = { metaModelIds: [1, 2], layout: { nodes: {} } };
+    const changes = { ...NO_CHANGES, metaModelIds: [1, 2], layout: { nodes: {} } };
 
     await client.syncChanges('12', changes);
 
@@ -86,7 +97,7 @@ describe('internal endpoints', () => {
 
   it('reuses the token for further requests', async () => {
     await client.getProject('12');
-    await client.syncChanges('12', {});
+    await client.syncChanges('12', NO_CHANGES);
 
     expect(keycloak.requests).toHaveLength(1);
     expect(backend.requests.map((request) => request.authorization)).toEqual([
@@ -112,7 +123,7 @@ describe('a rejected token', () => {
   it('fails with 401 if the new token is rejected too, without retrying again', async () => {
     accepted = new Set();
 
-    const error = await failure(client.syncChanges('12', {}));
+    const error = await failure(client.syncChanges('12', NO_CHANGES));
 
     expect(error).toBeInstanceOf(BackendError);
     expect((error as BackendError).status).toBe(401);
@@ -132,10 +143,50 @@ describe('failures', () => {
     expect(backend.requests).toHaveLength(1);
   });
 
+  it("keeps the message of the backend's error answer as detail", async () => {
+    answer = () => ({ status: 400, body: { error: 'Bad request', message: ' View names must be unique ' } });
+
+    const error = (await failure(client.syncChanges('12', NO_CHANGES))) as BackendError;
+
+    expect(error.detail).toBe('View names must be unique');
+    expect(error.message).toBe('The backend answered PUT /api/internal/v1/vsums/12/sync-changes with status 400');
+  });
+
+  it('cuts a long message of an error answer off', async () => {
+    answer = () => ({ status: 400, body: { message: 'x'.repeat(600) } });
+
+    const error = (await failure(client.syncChanges('12', NO_CHANGES))) as BackendError;
+
+    expect(error.detail).toBe(`${'x'.repeat(500)}…`);
+  });
+
+  it.each([
+    ['no JSON', '<html>'],
+    ['no message', { error: 'Bad request' }],
+    ['a blank message', { message: '  ' }],
+    ['a message that is no string', { message: 42 }],
+  ])('has no detail if the error answer has %s', async (_case, body) => {
+    answer = () => ({ status: 500, body });
+
+    const error = (await failure(client.getProject('12'))) as BackendError;
+
+    expect(error.status).toBe(500);
+    expect(error.detail).toBeUndefined();
+  });
+
+  it("fails without calling the backend if the request isn't JSON", async () => {
+    const changes = { ...NO_CHANGES, layout: { zoom: 1n } } as unknown as SyncChanges;
+
+    const error = await failure(client.syncChanges('12', changes));
+
+    expect(error).toBeInstanceOf(TypeError);
+    expect(backend.requests).toHaveLength(0);
+  });
+
   it('fails without status if the backend does not answer in time', async () => {
     answer = () => 'hang';
 
-    const error = await failure(client.syncChanges('12', {}));
+    const error = await failure(client.syncChanges('12', NO_CHANGES));
 
     expect(error).toBeInstanceOf(BackendError);
     expect((error as BackendError).status).toBeUndefined();
