@@ -1,4 +1,5 @@
 import { createBackendClient } from './backend.js';
+import { createBackendTokenVerifier } from './backendToken.js';
 import { loadConfig, type Config } from './config.js';
 import { createCollaborationServer } from './server.js';
 import { createServiceToken } from './serviceToken.js';
@@ -15,7 +16,12 @@ const backend = createBackendClient({
   backendUrl: config.backendUrl,
   serviceToken: createServiceToken(config.keycloak),
 });
-const server = createCollaborationServer({ backendUrl: config.backendUrl, backend });
+// Checks the backend's reload notifications. Keycloak's keys are only fetched for the first one.
+const backendTokens = createBackendTokenVerifier({
+  url: config.keycloak.url,
+  realm: config.keycloak.realm,
+});
+const server = createCollaborationServer({ backendUrl: config.backendUrl, backend, backendTokens });
 
 const port = await server.listen(config.port);
 console.log(`Collaboration server listening on port ${port}, backend at ${config.backendUrl}`);

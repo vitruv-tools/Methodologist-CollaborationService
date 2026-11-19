@@ -377,6 +377,204 @@ export function applyBackendState(
   }, SERVER_ORIGIN);
 }
 
+/**
+ * Brings a project as the backend returned it into a loaded document, as one change with
+ * {@link SERVER_ORIGIN}: used when the backend changed the project outside the document. Only the
+ * differences are applied, so connected clients receive them like any other change: elements the
+ * backend doesn't have are removed, changed fields are set, new elements are added, and unchanged
+ * elements, fields and descriptions stay as they are.
+ *
+ * Afterwards the document has the backend's state, as if it had been loaded with
+ * {@link fillDocument}, except that elements found by their `backendId` keep their keys. The
+ * backend wins: changes made in the document that the backend doesn't have are lost, including new
+ * elements that were never written back. The writeback error is cleared, since it was about such
+ * changes; the rest of `status` is kept.
+ *
+ * @returns the layout entries that Yjs can't store and that were therefore left out, like
+ *     {@link fillDocument}
+ */
+export function applyProject(doc: Doc, project: ProjectDetails): string[] {
+  const skipped: string[] = [];
+  doc.transact(() => {
+    const models = doc.getMap(MODELS);
+    const modelKeys = new Set<string>();
+    for (const metaModel of project.metaModels ?? []) {
+      const id = libraryId(metaModel);
+      if (id !== null) {
+        modelKeys.add(String(id));
+        updateElement<ModelFields>(models, String(id), { name: metaModel.name ?? '', ...NOT_DELETED });
+      }
+    }
+    deleteOthers(models, modelKeys);
+
+    const relations = doc.getMap(RELATIONS);
+    const relationKeys = new ElementKeys(relations);
+    for (const relation of project.metaModelsRelation ?? []) {
+      if (isId(relation.id) && isId(relation.sourceId) && isId(relation.targetId)) {
+        updateElement<RelationFields>(relations, relationKeys.claim(relation.id), {
+          backendId: relation.id,
+          sourceId: relation.sourceId,
+          targetId: relation.targetId,
+          reactionFileId: idOrNull(relation.reactionFileStorageId),
+          fineGranular: copyMappings(relation.fineGranularMetaModelRelationSet),
+          ...NOT_DELETED,
+        });
+      }
+    }
+    deleteOthers(relations, relationKeys.claimed);
+
+    const views = doc.getMap(VIEWS);
+    const viewKeys = new ElementKeys(views);
+    for (const view of project.views ?? []) {
+      if (isId(view.id)) {
+        updateElement<Omit<ViewFields, 'fileStorageId' | 'description'> & {
+          fileStorageId: number | null;
+          description: string;
+        }>(views, viewKeys.claim(view.id), {
+          backendId: view.id,
+          name: view.name ?? '',
+          description: view.description ?? '',
+          fileStorageId: idOrNull(view.fileStorageId),
+          metaModelIds: viewMetaModelIds(view),
+          ...NOT_DELETED,
+        });
+      }
+    }
+    deleteOthers(views, viewKeys.claimed);
+
+    const layout = doc.getMap(LAYOUT);
+    const stored = isObject(project.layout) ? project.layout : {};
+    for (const [key, value] of Object.entries(stored)) {
+      if (!LAYOUT_MAPS.includes(key)) {
+        updateValue(layout, key, value, key, skipped);
+      }
+    }
+    deleteOthers(layout, new Set([...Object.keys(stored), ...LAYOUT_MAPS]));
+    for (const key of LAYOUT_MAPS) {
+      let map = layout.get(key);
+      if (!(map instanceof Y.Map)) {
+        map = new Y.Map<unknown>();
+        layout.set(key, map);
+      }
+      const entries = isObject(stored[key]) ? stored[key] : {};
+      for (const [entryKey, value] of Object.entries(entries)) {
+        updateValue(map as YMap<unknown>, entryKey, value, `${key}.${entryKey}`, skipped);
+      }
+      deleteOthers(map as YMap<unknown>, new Set(Object.keys(entries)));
+    }
+
+    const status = doc.getMap(STATUS);
+    if (status.get(WRITEBACK_ERROR) !== null) {
+      status.set(WRITEBACK_ERROR, null);
+    }
+  }, SERVER_ORIGIN);
+  return skipped;
+}
+
+/** Fields of elements whose value is a `Y.Text`, edited character by character. */
+const TEXT_FIELDS: string[] = ['description' satisfies keyof ViewFields];
+
+/**
+ * Gives the element at `key` exactly these fields, changing only those that differ. Text fields are
+ * given as strings and kept in a `Y.Text`. If the value at `key` is no `Y.Map`, it is replaced.
+ */
+function updateElement<T>(elements: YMap<unknown>, key: string, fields: T): void {
+  const values = fields as Record<string, unknown>;
+  const current = elements.get(key);
+  if (!(current instanceof Y.Map)) {
+    const created: Record<string, unknown> = { ...values };
+    for (const name of TEXT_FIELDS.filter((field) => field in values)) {
+      created[name] = new Y.Text(values[name] as string);
+    }
+    elements.set(key, element(created));
+    return;
+  }
+  for (const [name, value] of Object.entries(values)) {
+    const old = current.get(name);
+    if (TEXT_FIELDS.includes(name)) {
+      if (!(old instanceof Y.Text)) {
+        current.set(name, new Y.Text(value as string));
+      } else if (old.toString() !== value) {
+        old.delete(0, old.length);
+        old.insert(0, value as string);
+      }
+    } else if (!isSameValue(name, old, value)) {
+      current.set(name, value);
+    }
+  }
+  deleteOthers(current, new Set(Object.keys(values)));
+}
+
+/**
+ * Whether a field already has a value. Fine-granular mappings are compared regardless of their
+ * order, which the backend doesn't keep.
+ */
+function isSameValue(name: string, current: unknown, value: unknown): boolean {
+  if (name === ('fineGranular' satisfies keyof RelationFields)) {
+    return Array.isArray(current) && Array.isArray(value) && isSameSet(current, value);
+  }
+  return !(current instanceof Y.AbstractType) && canonical(current) === canonical(value);
+}
+
+/** Sets a plain value if it differs. If Yjs can't store it, it is removed and reported instead. */
+function updateValue(
+  map: YMap<unknown>,
+  key: string,
+  value: unknown,
+  path: string,
+  skipped: string[],
+): void {
+  if (!(map.get(key) instanceof Y.AbstractType) && canonical(map.get(key)) === canonical(value)) {
+    return;
+  }
+  try {
+    map.set(key, value);
+  } catch {
+    skipped.push(path);
+    map.delete(key);
+  }
+}
+
+/** Removes all entries whose keys are not among `keep`. */
+function deleteOthers(map: YMap<unknown>, keep: Set<string>): void {
+  for (const key of [...map.keys()]) {
+    if (!keep.has(key)) {
+      map.delete(key);
+    }
+  }
+}
+
+/**
+ * The keys of a map's elements by their backend ID. An element the backend has keeps its key, also
+ * a UUID; a new one gets its backend ID as key, like when it is loaded.
+ */
+class ElementKeys {
+  /** The keys given out by {@link claim}. */
+  readonly claimed = new Set<string>();
+  private readonly byBackendId = new Map<number, string>();
+
+  constructor(elements: YMap<unknown>) {
+    for (const [key, value] of sortedEntries(elements)) {
+      const backendId = value instanceof Y.Map ? value.get('backendId') : undefined;
+      // Of two elements with the same backend ID, the one keyed by it wins, else the first.
+      if (isId(backendId) && (!this.byBackendId.has(backendId) || key === String(backendId))) {
+        this.byBackendId.set(backendId, key);
+      }
+    }
+  }
+
+  /** The key for the element with this backend ID. */
+  claim(backendId: number): string {
+    let key = this.byBackendId.get(backendId) ?? String(backendId);
+    if (this.claimed.has(key)) {
+      // Only if another element has this backend ID as its key but a different backend ID.
+      key = crypto.randomUUID();
+    }
+    this.claimed.add(key);
+    return key;
+  }
+}
+
 /** Reports why the last writeback failed in `status`, or that it succeeded (`null`). */
 export function setWritebackError(doc: Doc, message: string | null): void {
   const status = doc.getMap(STATUS);

@@ -605,10 +605,244 @@ describe('epochs', () => {
     again.release();
   });
 
+  it('keeps the epoch of a room when its project is reloaded', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    const epoch = String(epochOf(doc));
+    setWritebackError(doc, 'The changes could not be saved');
+    backend.projects.get('1')!.metaModels[0].name = 'Vehicle';
+
+    await rooms.reload('vsum:1');
+
+    expect(epochOf(doc)).toBe(epoch);
+    const again = await rooms.join('vsum:1', '1', epoch);
+    expect(again.doc).toBe(doc);
+  });
+
   it('checks the epoch, not what a client wrote into status', async () => {
     const alice = await rooms.join('vsum:1', '1');
     edit(alice.doc, () => alice.doc.getMap('status').set('epoch', 'forged'));
 
     await expect(rooms.join('vsum:1', '1', 'forged')).rejects.toBeInstanceOf(OutdatedDocumentError);
+  });
+});
+
+describe('reloading', () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const nameIn = (doc: Doc) => (doc.getMap('models').get('1') as YMap<unknown>).get('name');
+  /** Renames metamodel 1 in the backend, outside the document. */
+  const renameInBackend = (name: string) => {
+    backend.projects.get('1')!.metaModels[0].name = name;
+  };
+
+  it('does nothing for a project without a room', async () => {
+    await rooms.reload('vsum:1');
+
+    expect(backend.loads).toEqual([]);
+    expect(docs.has('vsum:1')).toBe(false);
+  });
+
+  it('brings changes made outside the document into it, in the same document', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    renameInBackend('Vehicle');
+
+    await rooms.reload('vsum:1');
+
+    expect(nameIn(doc)).toBe('Vehicle');
+    expect(docs.get('vsum:1')).toBe(doc);
+    expect(backend.loads).toEqual(['1', '1']);
+  });
+
+  it('cancels the pending writeback and drops the changes made since the last one', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    rename(doc, 'Mine');
+    renameInBackend('Theirs');
+
+    await rooms.reload('vsum:1');
+    await sleep(300);
+
+    expect(backend.requests).toEqual([]);
+    expect(nameIn(doc)).toBe('Theirs');
+    expect(storedName()).toBe('Theirs');
+  });
+
+  it('starts no writeback between the notification and the end of the reload', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    const loading = gate();
+    backend.nextLoads.push(loading.interruption);
+
+    const reloading = rooms.reload('vsum:1');
+    rename(doc, 'During the reload');
+    await sleep(300); // longer than the debounce delay and the maximum wait
+    expect(backend.requests).toEqual([]);
+    loading.open();
+    await reloading;
+    await sleep(100);
+
+    expect(backend.requests).toEqual([]);
+    expect(nameIn(doc)).toBe('Car');
+  });
+
+  it('waits for a running writeback before loading the project', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    const saving = gate();
+    backend.nextSyncs.push(saving.interruption);
+    rename(doc, 'Mine');
+    await vi.waitFor(() => expect(backend.requests).toHaveLength(1));
+
+    const reloading = rooms.reload('vsum:1');
+    await sleep(50);
+    expect(backend.loads).toEqual(['1']);
+    saving.open();
+    await reloading;
+
+    // Opening, the IDs after the writeback, then the reload.
+    expect(backend.loads).toEqual(['1', '1', '1']);
+    expect(nameIn(doc)).toBe('Mine');
+    expect(backend.requests).toHaveLength(1);
+  });
+
+  it('writes changes made after the reload back as usual, and only those', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    renameInBackend('Vehicle');
+    backend.projects.get('1')!.metaModels[1].name = 'Disc brake';
+    await rooms.reload('vsum:1');
+
+    rename(doc, 'Truck');
+
+    await vi.waitFor(() => expect(storedName()).toBe('Truck'));
+    expect(backend.changes).toEqual(['rename model 1']);
+  });
+
+  it('clears the writeback error, which was about the dropped changes', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    setWritebackError(doc, 'The changes could not be saved: View names must be unique');
+
+    await rooms.reload('vsum:1');
+
+    expect(writebackError(doc)).toBeNull();
+  });
+
+  it('reloads a project that was still loading once it is loaded', async () => {
+    const loading = gate();
+    backend.nextLoads.push(loading.interruption);
+    const joining = rooms.join('vsum:1', '1');
+
+    const reloading = rooms.reload('vsum:1');
+    loading.open();
+    await joining;
+    await reloading;
+
+    expect(backend.loads).toEqual(['1', '1']);
+  });
+
+  it('reloads once more if the backend changes the project again during a reload', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    const loading = gate();
+    backend.nextLoads.push(loading.interruption);
+
+    const first = rooms.reload('vsum:1');
+    await vi.waitFor(() => expect(backend.loads).toHaveLength(2)); // the reload is loading
+    renameInBackend('Second');
+    const second = rooms.reload('vsum:1');
+    const third = rooms.reload('vsum:1');
+    loading.open();
+    await Promise.all([first, second, third]);
+
+    expect(backend.loads).toEqual(['1', '1', '1']);
+    expect(nameIn(doc)).toBe('Second');
+  });
+
+  it('loads only once for notifications that arrive before the reload started loading', async () => {
+    await rooms.join('vsum:1', '1');
+
+    await Promise.all([rooms.reload('vsum:1'), rooms.reload('vsum:1'), rooms.reload('vsum:1')]);
+
+    expect(backend.loads).toEqual(['1', '1']);
+  });
+
+  it('retries loading with a growing delay, tells the users, and still writes nothing meanwhile', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    backend.nextLoads.push(new BackendError(503, 'status 503'), new BackendError(undefined, 'timeout'));
+    renameInBackend('Vehicle');
+    const errors: unknown[] = [];
+    doc.getMap('status').observe(() => errors.push(writebackError(doc)));
+
+    const reloading = rooms.reload('vsum:1');
+    rename(doc, 'Mine');
+    await reloading;
+    await sleep(100);
+
+    expect(backend.loads).toEqual(['1', '1', '1', '1']);
+    expect(nameIn(doc)).toBe('Vehicle');
+    expect(backend.requests).toEqual([]);
+    expect(errors).toEqual([
+      'Changes made outside this document could not be loaded yet, so nothing is saved until they are: the backend answered with status 503',
+      'Changes made outside this document could not be loaded yet, so nothing is saved until they are: the backend is not available',
+      null,
+    ]);
+    expect(logged.mock.calls.flat().join(' ')).toContain('Reloading vsum:1 failed, trying again in 10 ms');
+  });
+
+  it('drops a room nobody uses anymore instead of reloading it, without writing it back', async () => {
+    backend.nextSyncs.push(new BackendError(400, 'status 400'), new BackendError(400, 'status 400'));
+    const alice = await rooms.join('vsum:1', '1');
+    rename(alice.doc, 'Rejected');
+    await vi.waitFor(() => expect(writebackError(alice.doc)).not.toBeNull());
+    alice.release(); // tries the rejected writeback once more
+    await vi.waitFor(() => expect(backend.requests).toHaveLength(2));
+    expect(docs.has('vsum:1')).toBe(true); // kept, since its changes were rejected
+    const loads = backend.loads.length;
+
+    await rooms.reload('vsum:1');
+
+    expect(docs.has('vsum:1')).toBe(false);
+    expect(backend.loads).toHaveLength(loads);
+    expect(backend.requests).toHaveLength(2);
+    const bob = await rooms.join('vsum:1', '1');
+    expect(nameIn(bob.doc)).toBe('Car');
+  });
+
+  it('drops the room if its last user leaves during the reload', async () => {
+    const alice = await rooms.join('vsum:1', '1');
+    rename(alice.doc, 'Mine');
+    const loading = gate();
+    backend.nextLoads.push(loading.interruption);
+
+    const reloading = rooms.reload('vsum:1');
+    alice.release();
+    loading.open();
+    await reloading;
+
+    expect(docs.has('vsum:1')).toBe(false);
+    expect(backend.requests).toEqual([]);
+  });
+
+  it('stops waiting for the next attempt when the server shuts down', async () => {
+    rooms = createRooms({ backend, writeback: { ...TIMINGS, minRetryDelayMs: 60_000, maxRetryDelayMs: 60_000 } });
+    await rooms.join('vsum:1', '1');
+    backend.nextLoads.push(new BackendError(503, 'status 503'));
+    const reloading = rooms.reload('vsum:1');
+    await vi.waitFor(() => expect(backend.loads).toHaveLength(2)); // failed, waits 60 s
+
+    await rooms.closeAll(1000);
+    await reloading;
+
+    expect(backend.loads).toHaveLength(2);
+    expect(backend.requests).toEqual([]);
+  });
+
+  it('stops when the server shuts down, without writing the room back', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    rename(doc, 'Mine');
+    const loading = gate();
+    backend.nextLoads.push(loading.interruption);
+
+    const reloading = rooms.reload('vsum:1');
+    await rooms.closeAll(1000);
+    loading.open();
+    await reloading;
+
+    expect(backend.requests).toEqual([]);
+    expect(docs.has('vsum:1')).toBe(false);
   });
 });

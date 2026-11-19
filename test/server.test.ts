@@ -5,12 +5,14 @@ import { WebsocketProvider } from 'y-websocket';
 import { docs, setPersistence } from 'y-websocket/bin/utils';
 import * as Y from 'yjs';
 import { BackendError } from '../src/backend.js';
+import { BACKEND_ROLE, createBackendTokenVerifier, type BackendTokenVerifier } from '../src/backendToken.js';
 import {
   createCollaborationServer,
   MAX_MESSAGE_BYTES,
   type CollaborationServer,
 } from '../src/server.js';
 import { details, startFakeBackend, type FakeAnswer, type FakeBackend } from './fakeBackend.js';
+import { REALM, startFakeKeycloak, type FakeKeycloak } from './fakeKeycloak.js';
 import { FakeProjects, gate } from './fakeProjects.js';
 
 /**
@@ -44,6 +46,9 @@ function answer(token: string | undefined, projectId: string): FakeAnswer {
 const TIMINGS = { debounceMs: 20, maxWaitMs: 200, minRetryDelayMs: 10, maxRetryDelayMs: 40 };
 
 let backend: FakeBackend;
+/** Issues the backend's tokens for reload notifications. */
+let keycloak: FakeKeycloak;
+let backendTokens: BackendTokenVerifier;
 /** The backend's internal endpoints, which projects are loaded from and written back to. */
 let projects: FakeProjects;
 let server: CollaborationServer;
@@ -53,11 +58,14 @@ const providers: WebsocketProvider[] = [];
 
 beforeAll(async () => {
   backend = await startFakeBackend(answer);
+  keycloak = await startFakeKeycloak();
+  backendTokens = createBackendTokenVerifier({ url: keycloak.url, realm: REALM, timeoutMs: 300 });
   projects = new FakeProjects();
   server = createCollaborationServer({
     backendUrl: backend.url,
     backendTimeoutMs: 300,
     backend: projects,
+    backendTokens,
     writeback: TIMINGS,
   });
   const port = await server.listen(0);
@@ -76,6 +84,7 @@ afterEach(() => {
 afterAll(async () => {
   await server.close();
   await backend.close();
+  await keycloak.close();
   vi.restoreAllMocks();
 });
 
@@ -266,7 +275,11 @@ describe('access', () => {
   it('rejects with 503 if the backend is not reachable', async () => {
     const stopped = await startFakeBackend(answer);
     await stopped.close();
-    const lonelyServer = createCollaborationServer({ backendUrl: stopped.url, backend: projects });
+    const lonelyServer = createCollaborationServer({
+      backendUrl: stopped.url,
+      backend: projects,
+      backendTokens,
+    });
     const port = await lonelyServer.listen(0);
     try {
       const status = await new Promise((resolve, reject) => {
@@ -375,6 +388,7 @@ async function startServerWithoutDelayedWritebacks(): Promise<{
   const other = createCollaborationServer({
     backendUrl: backend.url,
     backend: projects,
+    backendTokens,
     writeback: { ...TIMINGS, debounceMs: 60_000, maxWaitMs: 60_000 },
   });
   return { server: other, url: `ws://localhost:${await other.listen(0)}` };
@@ -613,6 +627,7 @@ describe('robustness', () => {
     const other = createCollaborationServer({
       backendUrl: backend.url,
       backend: projects,
+      backendTokens,
       writeback: TIMINGS,
       shutdownTimeoutMs: 1000,
     });
@@ -668,7 +683,12 @@ describe('robustness', () => {
   it("doesn't let y-websocket store documents, even if a persistence was set", async () => {
     const bindState = vi.fn();
     setPersistence({ provider: null, bindState, writeState: async () => {} } as never);
-    const other = createCollaborationServer({ backendUrl: backend.url, backend: projects, writeback: TIMINGS });
+    const other = createCollaborationServer({
+      backendUrl: backend.url,
+      backend: projects,
+      backendTokens,
+      writeback: TIMINGS,
+    });
     try {
       const url = `ws://localhost:${await other.listen(0)}`;
       projects.add('55', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
@@ -830,5 +850,139 @@ describe('outdated documents', () => {
     const fresh = await connect('vsum:87', 'owner', new Y.Doc(), wsUrl, { epoch: '' });
 
     expect(model(fresh.doc, '1')?.get('name')).toBe('A');
+  });
+});
+
+describe('reload notifications', () => {
+  /** Sends the backend's notification that a project changed. */
+  async function notify(path: string, authorization?: string, method = 'POST'): Promise<Response> {
+    return fetch(`${httpUrl}${path}`, {
+      method,
+      headers: authorization === undefined ? {} : { Authorization: authorization },
+    });
+  }
+
+  /** Sends a request line as it is, without a client that would correct it; returns the status. */
+  function rawStatus(requestLine: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const socket = connectTcp(Number(new URL(httpUrl).port), 'localhost', () => {
+        socket.end(`${requestLine}\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n`);
+      });
+      let received = '';
+      socket.on('data', (chunk: Buffer) => (received += chunk.toString()));
+      socket.on('end', () => resolve(Number(/^HTTP\/1\.1 (\d+)/.exec(received)?.[1])));
+      socket.on('error', reject);
+    });
+  }
+
+  const backendToken = async () => `Bearer ${await keycloak.signToken({ roles: [BACKEND_ROLE] })}`;
+  const accessChecks = () => backend.requests.length;
+
+  it('bring a change made outside the document to connected clients, without reconnecting', async () => {
+    projects.add('70', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const client = await connect('vsum:70', 'owner');
+    const models = client.doc.getMap('models');
+    const checks = accessChecks();
+    projects.projects.get('70')!.metaModels[0].name = 'Vehicle';
+
+    const response = await notify('/internal/projects/70/reload', await backendToken());
+
+    expect(response.status).toBe(202);
+    await vi.waitFor(() => expect((models.get('1') as Y.Map<unknown>).get('name')).toBe('Vehicle'));
+    expect(accessChecks()).toBe(checks);
+    expect(client.wsconnected).toBe(true);
+  });
+
+  it('keep the epoch of the room, so a client that reconnects afterwards is not closed as outdated', async () => {
+    projects.add('72', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const alice = await connect('vsum:72', 'owner');
+    const bob = await connect('vsum:72', 'member'); // keeps the room open
+    const epoch = String(alice.doc.getMap('status').get('epoch'));
+    const nameIn = (doc: Y.Doc) => (doc.getMap('models').get('1') as Y.Map<unknown>).get('name');
+    alice.disconnect();
+    projects.projects.get('72')!.metaModels[0].name = 'Vehicle';
+
+    await notify('/internal/projects/72/reload', await backendToken());
+    await vi.waitFor(() => expect(nameIn(bob.doc)).toBe('Vehicle'));
+    alice.params.epoch = epoch;
+    alice.connect();
+
+    await vi.waitFor(() => expect(nameIn(alice.doc)).toBe('Vehicle'));
+    expect(alice.wsconnected).toBe(true);
+    expect(String(bob.doc.getMap('status').get('epoch'))).toBe(epoch);
+  });
+
+  it('do nothing for a project nobody has open', async () => {
+    const loads = projects.loads.length;
+
+    const response = await notify('/internal/projects/71/reload', await backendToken());
+
+    expect(response.status).toBe(202);
+    expect(projects.loads).toHaveLength(loads);
+  });
+
+  it.each([
+    ['without token', undefined],
+    ['with an invalid token', 'Bearer not-a-token'],
+  ])('are rejected with 401 %s', async (_name, authorization) => {
+    const response = await notify('/internal/projects/70/reload', authorization);
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get('www-authenticate')).toBe('Bearer');
+  });
+
+  it('are rejected with 401 if the token is forged or expired', async () => {
+    for (const options of [{ forged: true }, { expiresIn: -60 }]) {
+      const token = await keycloak.signToken({ roles: [BACKEND_ROLE], ...options });
+
+      expect((await notify('/internal/projects/70/reload', `Bearer ${token}`)).status).toBe(401);
+    }
+  });
+
+  it("are rejected with 403 if the token lacks the backend's role", async () => {
+    const userToken = await keycloak.signToken({ roles: ['user'] });
+
+    const response = await notify('/internal/projects/70/reload', `Bearer ${userToken}`);
+
+    expect(response.status).toBe(403);
+  });
+
+  it.each(['abc', '012', '-1', '1234567890123456789'])(
+    'are rejected with 400 for the invalid project ID %s',
+    async (id) => {
+      expect((await notify(`/internal/projects/${id}/reload`, await backendToken())).status).toBe(400);
+    },
+  );
+
+  it('survive malformed paths', async () => {
+    expect((await notify('/internal/projects/%/reload', await backendToken())).status).toBe(400);
+    expect(await rawStatus('POST http://[bad/internal/projects/1/reload HTTP/1.1')).toBe(400);
+    expect((await fetch(`${httpUrl}/health`)).status).toBe(200);
+  });
+
+  it('check the token before the project ID', async () => {
+    expect((await notify('/internal/projects/abc/reload')).status).toBe(401);
+  });
+
+  it('only accept POST', async () => {
+    const response = await notify('/internal/projects/70/reload', await backendToken(), 'GET');
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get('allow')).toBe('POST');
+  });
+
+  it('are unknown on other paths', async () => {
+    for (const path of ['/internal/projects/70', '/internal/projects/70/reload/x', '/internal']) {
+      expect((await notify(path, await backendToken())).status).toBe(404);
+    }
+  });
+
+  it('never log the token', async () => {
+    const token = await keycloak.signToken({ roles: [BACKEND_ROLE], forged: true });
+    await notify('/internal/projects/70/reload', `Bearer ${token}`);
+
+    const logged = vi.mocked(console.error).mock.calls.flat().join(' ');
+    expect(logged).toContain('Rejected a reload notification');
+    expect(logged).not.toContain(token);
   });
 });

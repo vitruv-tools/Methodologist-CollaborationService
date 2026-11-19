@@ -5,6 +5,7 @@ import { WebSocketServer } from 'ws';
 import { setPersistence, setupWSConnection } from 'y-websocket/bin/utils';
 import { AccessError, fetchRole, parseRoomName, type BackendOptions, type Role } from './access.js';
 import { BackendError, type BackendClient } from './backend.js';
+import { TokenError, type BackendTokenVerifier } from './backendToken.js';
 import { describeError } from './errors.js';
 import { makeReadOnly } from './readOnly.js';
 import { EPOCH_PARAM, OUTDATED_DOCUMENT_CLOSE_CODE } from './document.js';
@@ -23,6 +24,8 @@ export const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
 export interface CollaborationServerOptions extends BackendOptions {
   /** Client of the backend's internal endpoints, which loads projects and writes changes back. */
   backend: BackendClient;
+  /** Checks the token the backend sends its reload notifications with. */
+  backendTokens: BackendTokenVerifier;
   /** Defaults to {@link DEFAULT_WRITEBACK_TIMINGS}. */
   writeback?: Partial<WritebackTimings>;
   /** Defaults to {@link DEFAULT_SHUTDOWN_TIMEOUT_MS}. */
@@ -63,6 +66,9 @@ interface Access {
  *   room's epoch, or the project has no room, its document is outdated: the connection is accepted
  *   and closed with code `4409` without joining or loading the room, so nothing of the document
  *   reaches it. Browsers can read close codes, but not the status of a rejected handshake.
+ * - `POST /internal/projects/{id}/reload`, called by the backend with its service account's token,
+ *   reloads the project's room after the backend changed the project outside the document. It
+ *   answers `202` once the reload started, also if the project has no room.
  *
  * Only one server per process: rooms are kept in y-websocket's module-wide `docs` map.
  */
@@ -77,7 +83,23 @@ export function createCollaborationServer(options: CollaborationServerOptions): 
   const waiting = new Set<Duplex>();
   let closing = false;
 
-  const httpServer = createServer(handleHttpRequest);
+  const httpServer = createServer((request, response) => {
+    handleHttpRequest(request, response, (projectId, authorization) =>
+      notifyReload(projectId, authorization),
+    );
+  });
+
+  /**
+   * Handles the backend's notification that a project changed outside the document.
+   *
+   * @throws TokenError if the token isn't the backend's, AccessError (`400`) if the ID is invalid
+   */
+  async function notifyReload(projectId: string, authorization: string | undefined): Promise<void> {
+    await options.backendTokens.verify(authorization);
+    const roomName = `vsum:${projectId}`;
+    parseRoomName(roomName);
+    void rooms.reload(roomName);
+  }
   httpServer.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     // Without a listener, a connection error while waiting for the backend would crash the server.
     socket.on('error', () => socket.destroy());
@@ -252,12 +274,54 @@ function reject(socket: Duplex, error: unknown): void {
   );
 }
 
-function handleHttpRequest(request: IncomingMessage, response: ServerResponse): void {
+const RELOAD_PATH = /^\/internal\/projects\/([^/]+)\/reload$/;
+
+function handleHttpRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  reload: (projectId: string, authorization: string | undefined) => Promise<void>,
+): void {
+  // The body isn't used; reading it lets the connection be reused.
+  request.resume();
   if (request.method === 'GET' && request.url === '/health') {
     response.writeHead(200, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ status: 'UP' }));
     return;
   }
-  response.writeHead(404, { 'Content-Type': 'text/plain' });
-  response.end('Not found');
+  let path: string;
+  try {
+    path = new URL(request.url ?? '/', 'http://localhost').pathname;
+  } catch {
+    answer(response, 400, 'Bad request');
+    return;
+  }
+  const reloadMatch = RELOAD_PATH.exec(path);
+  if (reloadMatch === null) {
+    answer(response, 404, 'Not found');
+    return;
+  }
+  if (request.method !== 'POST') {
+    answer(response, 405, 'Method not allowed', { Allow: 'POST' });
+    return;
+  }
+  // Not decoded: a valid project ID has digits only, and anything else is rejected with 400.
+  reload(reloadMatch[1], request.headers.authorization).then(
+    () => answer(response, 202, 'Reloading'),
+    (error: unknown) => {
+      const status = error instanceof TokenError || error instanceof AccessError ? error.status : 500;
+      // Only the message is logged, never the header: it contains the token.
+      console.error('Rejected a reload notification:', describeError(error));
+      answer(response, status, STATUS_CODES[status] ?? 'Error', status === 401 ? { 'WWW-Authenticate': 'Bearer' } : {});
+    },
+  );
+}
+
+function answer(
+  response: ServerResponse,
+  status: number,
+  text: string,
+  headers: Record<string, string> = {},
+): void {
+  response.writeHead(status, { 'Content-Type': 'text/plain', ...headers });
+  response.end(text);
 }

@@ -7,13 +7,19 @@ export interface Config {
    * and called with the service account.
    */
   backendUrl: string;
-  /** Login of the collaboration server's own service account. */
+  /**
+   * Login of the collaboration server's own service account. The same Keycloak's public keys check
+   * the tokens of the backend's reload notifications.
+   */
   keycloak: KeycloakConfig;
 }
 
 /** How the collaboration server gets its service token from Keycloak. */
 export interface KeycloakConfig {
-  /** Base URL of Keycloak without a trailing slash, e.g. `http://localhost:7668`. */
+  /**
+   * Base URL of Keycloak without a trailing slash, e.g. `http://localhost:7668`. Must be the URL the
+   * backend gets its tokens from, since that is their issuer.
+   */
   url: string;
   realm: string;
   clientId: string;
