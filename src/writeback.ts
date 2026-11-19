@@ -47,6 +47,18 @@ export interface Writeback {
   readonly hasChanges: boolean;
   /** Whether a write is running or waits to be tried again. */
   readonly busy: boolean;
+  /**
+   * Stops writing back until {@link resume}, e.g. while the document is reloaded from the backend:
+   * a pending write or retry is cancelled, and neither changes nor {@link flush} start a write.
+   * Resolves once a running write finished; if it fails, it isn't retried.
+   */
+  pause(): Promise<void>;
+  /**
+   * Writes back again after {@link pause}. With `discardChanges`, all changes so far count as
+   * written, e.g. because the document now has the backend's state. Otherwise they are written
+   * after the debounce delay.
+   */
+  resume(options: { discardChanges: boolean }): void;
   /** Stops all timers. Nothing is written back afterwards. */
   dispose(): void;
 }
@@ -77,6 +89,7 @@ export function createWriteback(options: WritebackOptions): Writeback {
   let maxWaitTimer: NodeJS.Timeout | undefined;
   let retryTimer: NodeJS.Timeout | undefined;
   let disposed = false;
+  let paused = false;
 
   const hasChanges = () => version !== savedVersion;
 
@@ -89,7 +102,7 @@ export function createWriteback(options: WritebackOptions): Writeback {
 
   /** Starts a write if one is needed. A running write is followed by another one. */
   function writeNow(retry: boolean, force = false): void {
-    if (disposed) {
+    if (disposed || paused) {
       return;
     }
     if (running !== undefined) {
@@ -114,7 +127,10 @@ export function createWriteback(options: WritebackOptions): Writeback {
         },
         (error: unknown) => {
           let retryInMs: number | undefined;
-          if (retry && options.isRetryable(error)) {
+          if (paused) {
+            // Retried after resume, if the changes aren't discarded.
+            failures = 0;
+          } else if (retry && options.isRetryable(error)) {
             failures += 1;
             retryInMs = Math.min(
               timings.minRetryDelayMs * 2 ** (failures - 1),
@@ -153,6 +169,16 @@ export function createWriteback(options: WritebackOptions): Writeback {
       });
   }
 
+  /** Schedules a write after the debounce delay, and at the latest after the maximum wait. */
+  function schedule(): void {
+    if (disposed || paused || retryTimer !== undefined) {
+      return;
+    }
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => writeNow(true), timings.debounceMs);
+    maxWaitTimer ??= setTimeout(() => writeNow(true), timings.maxWaitMs);
+  }
+
   return {
     markChanged() {
       if (disposed) {
@@ -160,12 +186,7 @@ export function createWriteback(options: WritebackOptions): Writeback {
       }
       version += 1;
       blocked = false;
-      if (retryTimer !== undefined) {
-        return;
-      }
-      clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => writeNow(true), timings.debounceMs);
-      maxWaitTimer ??= setTimeout(() => writeNow(true), timings.maxWaitMs);
+      schedule();
     },
     async flush({ retry = true, force = false } = {}) {
       while (running !== undefined) {
@@ -181,6 +202,24 @@ export function createWriteback(options: WritebackOptions): Writeback {
     },
     get busy() {
       return running !== undefined || retryTimer !== undefined;
+    },
+    async pause() {
+      paused = true;
+      writeAgain = false;
+      clearTimers();
+      while (running !== undefined) {
+        await running;
+      }
+    },
+    resume({ discardChanges }) {
+      paused = false;
+      failures = 0;
+      if (discardChanges) {
+        savedVersion = version;
+        blocked = false;
+      } else if (hasChanges()) {
+        schedule();
+      }
     },
     dispose() {
       disposed = true;

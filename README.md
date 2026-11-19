@@ -4,7 +4,7 @@ Real-time collaboration server for the Vitruv Methodologist: syncs project edits
 
 Design: [vitruv-tools/Vitruv-UI-Methodologist#635](https://github.com/vitruv-tools/Vitruv-UI-Methodologist/issues/635)
 
-**Status:** in development. The server checks access, loads projects from the backend and writes changes back. The frontend doesn't use it yet.
+**Status:** in development. The server checks access, loads projects from the backend, writes changes back and reloads projects the backend changed. The frontend doesn't use it yet.
 
 ## How it works
 
@@ -13,6 +13,7 @@ Design: [vitruv-tools/Vitruv-UI-Methodologist#635](https://github.com/vitruv-too
 - Before a connection is accepted, the backend is asked for the user's role in the project (`GET /api/v1/vsums/{id}/details` with the user's token). Viewers can read but not change the document.
 - When the first user opens a project, the server loads it from the backend (`GET /api/internal/v1/vsums/{id}/details` with its own service account) into the room's document. Connections are accepted once that's done. If loading fails, the connection is rejected and that empty document is never written back; the next connection tries loading again.
 - Changes are written back automatically (`PUT /api/internal/v1/vsums/{id}/sync-changes`): 5 seconds after the last change, at the latest every 60 seconds, when the last user leaves and when the server stops. Each writeback sends the complete state; Postgres stays the source of truth. A failed writeback keeps the changes and is reported in the document's `status.writebackError`. It is retried with a growing delay if the backend failed or didn't answer; otherwise (e.g. `400`), it is tried again after the next change and when the last user leaves. An element the server can't read is reported the same way instead of being written back.
+- When the backend changes a project outside the document (version restore, `LinkMetaModelsPanel`, metamodel renames and ecore saves), it calls `POST /internal/projects/{id}/reload` with the token of its service account. The server checks the token against Keycloak's public keys (issuer `{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}`, realm role `methodologist-backend`) and answers `401` for a missing, invalid or expired token, `403` without the role, `400` for an invalid project ID and otherwise `202`. For an open project, it pauses the room's writeback right away, waits for a writeback that is already running, loads the project and applies only the differences to the document, so connected clients see the change without reconnecting. The backend wins: changes made in the document that weren't written back yet are dropped. If loading fails, it is retried with a growing delay, and nothing is written back until it succeeds. A project nobody has open needs nothing; a room nobody uses anymore is dropped.
 - A room is dropped once its last user left and its changes are written back; a room whose changes the backend keeps rejecting stays in memory until a user fixes them or the server stops. Documents are kept in memory only, so changes from the last seconds before a crash are lost.
 - The document's layout (metamodels, relations, views, positions, status) is described in [`src/document.ts`](src/document.ts).
 - `GET /health` returns `200` with `{"status":"UP"}`.
@@ -36,7 +37,7 @@ The server reads its settings from environment variables (see `.env.example`), e
 |---|---|---|
 | `PORT` | `1234` | Port for HTTP and WebSocket connections |
 | `BACKEND_URL` | `http://localhost:9811` | Base URL of the backend |
-| `KEYCLOAK_URL` | (required) | Base URL of Keycloak, where the server gets the token of its service account |
+| `KEYCLOAK_URL` | (required) | Base URL of Keycloak, where the server gets the token of its service account and the keys that check the backend's tokens. Must be the URL the backend gets its token from (the token's issuer), otherwise reload notifications get `401` |
 | `KEYCLOAK_REALM` | `methodologist` | Keycloak realm |
 | `KEYCLOAK_CLIENT_ID` | `collaboration-service` | Client of the service account |
 | `KEYCLOAK_CLIENT_SECRET` | (required) | Secret of that client |
@@ -66,6 +67,8 @@ curl http://localhost:1234/health
 - **Soft delete:** soft-deleted elements are left out of the writeback, so the backend deletes them. Restoring a metamodel afterwards adds it again from the model library, without the project's own changes to its Ecore.
 - **Fine-granular mappings** are plain JSON, replaced as a whole. If a user changes a relation's mappings at the moment the server adds new IDs to them, one of the two changes is lost.
 - **Outdated client documents:** a client that reconnects with its old document after a room was dropped or the server restarted merges it into the newly loaded one (#11).
+- **A writeback running when the backend changes a project** can still overwrite that change: the server waits for it before reloading, but can't take it back once it was sent. Preventing that needs the backend, e.g. a version check on `sync-changes`.
+- **Changes the backend doesn't announce** are undone by the next writeback, which sends the complete state. The backend notifies only for the changes listed above (vitruv-tools/methodologistUI-backend#425).
 - **Rejected changes stay in memory:** a room whose changes the backend keeps rejecting stays until a user fixes them or the server stops; then they are lost.
 
 ## Notes

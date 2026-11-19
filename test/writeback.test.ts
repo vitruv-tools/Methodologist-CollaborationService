@@ -6,8 +6,11 @@ const TIMINGS = { debounceMs: 5000, maxWaitMs: 60_000, minRetryDelayMs: 1000, ma
 class Retryable extends Error {}
 class Rejected extends Error {}
 
-/** Results of the next writes, in order; a write without one succeeds. */
-let results: (Error | { gate: Promise<void> })[];
+/**
+ * Results of the next writes, in order; a write without one succeeds. A gate makes the write run
+ * until it opens, and then fail with `error` if it has one.
+ */
+let results: (Error | { gate: Promise<void>; error?: Error })[];
 let writes: number;
 let failures: [unknown, number | undefined][];
 let successes: number;
@@ -31,6 +34,9 @@ beforeEach(() => {
       }
       if (result !== undefined) {
         await result.gate;
+        if (result.error !== undefined) {
+          throw result.error;
+        }
       }
     },
     isRetryable: (error) => error instanceof Retryable,
@@ -49,10 +55,10 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-/** A write that runs until `open` is called. */
-function slowWrite(): () => void {
+/** A write that runs until `open` is called, and then fails with `error` if given. */
+function slowWrite(error?: Error): () => void {
   let open = () => {};
-  results.push({ gate: new Promise<void>((resolve) => (open = resolve)) });
+  results.push({ gate: new Promise<void>((resolve) => (open = resolve)), error });
   return open;
 }
 
@@ -457,5 +463,131 @@ describe('a forced flush', () => {
 
     expect(writes).toBe(2);
     expect(writeback.hasChanges).toBe(false);
+  });
+});
+
+describe('pause', () => {
+  it('cancels a pending write, and changes start none while paused', async () => {
+    writeback.markChanged();
+
+    void writeback.pause();
+    await vi.advanceTimersByTimeAsync(120_000);
+    writeback.markChanged();
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(writes).toBe(0);
+    expect(writeback.hasChanges).toBe(true);
+  });
+
+  it('cancels a pending retry', async () => {
+    results.push(new Retryable());
+    writeback.markChanged();
+    await vi.advanceTimersByTimeAsync(5000);
+
+    await writeback.pause();
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(writes).toBe(1);
+  });
+
+  it('resolves once the running write finished', async () => {
+    const open = slowWrite();
+    writeback.markChanged();
+    await vi.advanceTimersByTimeAsync(5000);
+    let paused = false;
+
+    const pausing = writeback.pause().then(() => (paused = true));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(paused).toBe(false);
+    expect(writeback.busy).toBe(true);
+    open();
+    await pausing;
+
+    expect(writeback.busy).toBe(false);
+  });
+
+  it('does not retry a write that fails while pausing', async () => {
+    const open = slowWrite(new Retryable());
+    writeback.markChanged();
+    await vi.advanceTimersByTimeAsync(5000);
+
+    const pausing = writeback.pause();
+    open();
+    await pausing;
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(writes).toBe(1);
+    expect(failures).toEqual([[expect.any(Retryable), undefined]]);
+    expect(writeback.busy).toBe(false);
+  });
+
+  it('does not write a change made during the running write when it finishes', async () => {
+    const open = slowWrite();
+    writeback.markChanged();
+    await vi.advanceTimersByTimeAsync(5000);
+    writeback.markChanged();
+    await vi.advanceTimersByTimeAsync(5000); // due while the write runs
+
+    const pausing = writeback.pause();
+    open();
+    await pausing;
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(writes).toBe(1);
+    expect(writeback.hasChanges).toBe(true);
+  });
+
+  it('makes flushing write nothing, also when forced', async () => {
+    writeback.markChanged();
+    await writeback.pause();
+
+    await writeback.flush();
+    await writeback.flush({ force: true });
+
+    expect(writes).toBe(0);
+  });
+});
+
+describe('resume', () => {
+  it('with discarded changes counts all changes so far as written', async () => {
+    writeback.markChanged();
+    await writeback.pause();
+    writeback.markChanged();
+
+    writeback.resume({ discardChanges: true });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(writes).toBe(0);
+    expect(writeback.hasChanges).toBe(false);
+
+    writeback.markChanged();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(writes).toBe(1);
+  });
+
+  it('without discarding writes the changes after the debounce delay', async () => {
+    writeback.markChanged();
+    await writeback.pause();
+
+    writeback.resume({ discardChanges: false });
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(writes).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(writes).toBe(1);
+  });
+
+  it('with discarded changes starts retries again with the shortest delay', async () => {
+    results.push(new Retryable(), new Retryable());
+    writeback.markChanged();
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(1000);
+    await writeback.pause();
+
+    writeback.resume({ discardChanges: true });
+    results.push(new Retryable());
+    writeback.markChanged();
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(failures.map(([, retryInMs]) => retryInMs)).toEqual([1000, 2000, 1000]);
   });
 });
