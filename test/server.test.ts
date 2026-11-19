@@ -98,12 +98,13 @@ async function connect(
   token: string,
   doc = new Y.Doc(),
   url = wsUrl,
+  params: Record<string, string> = {},
 ): Promise<WebsocketProvider> {
   const provider = new WebsocketProvider(url, room, doc, {
     WebSocketPolyfill: WebSocket as unknown as typeof globalThis.WebSocket,
     // Clients in one process would otherwise sync through a BroadcastChannel, bypassing the server.
     disableBc: true,
-    params: { token },
+    params: { token, ...params },
   });
   providers.push(provider);
   await new Promise<void>((resolve) => {
@@ -714,6 +715,144 @@ describe('room names', () => {
   });
 });
 
+describe('outdated documents', () => {
+  const epochOf = (doc: Y.Doc) => String(doc.getMap('status').get('epoch'));
+  const model = (doc: Y.Doc, key: string) => doc.getMap('models').get(key) as Y.Map<unknown> | undefined;
+
+  /** Resolves with the code of the next close of a provider's connection. */
+  function nextCloseCode(provider: WebsocketProvider): Promise<number | undefined> {
+    return new Promise((resolve) => {
+      const onClose = (event: { code?: number } | null) => {
+        provider.off('connection-close', onClose);
+        resolve(event?.code);
+      };
+      provider.on('connection-close', onClose);
+    });
+  }
+
+  /** Disconnects a client, keeping its document, like a laptop going to sleep. */
+  function sleep(provider: WebsocketProvider): void {
+    provider.disconnect();
+  }
+
+  it("are closed with 4409 after their room was created again, and don't bring deleted models back", async () => {
+    projects.add('80', {
+      metaModels: [
+        { id: 101, sourceId: 1, name: 'A' },
+        { id: 102, sourceId: 2, name: 'B' },
+      ],
+    });
+    // Alice's laptop goes to sleep with model A on the canvas.
+    const alice = await connect('vsum:80', 'owner');
+    const aliceEpoch = epochOf(alice.doc);
+    sleep(alice);
+    await vi.waitFor(() => expect(docs.has('vsum:80')).toBe(false));
+    // Bob deletes A, the deletion is written back, and Bob leaves.
+    const bob = await connect('vsum:80', 'member');
+    model(bob.doc, '1')?.set('softDeleted', true);
+    await vi.waitFor(() => expect(projects.projects.get('80')?.metaModels.map((m) => m.sourceId)).toEqual([2]));
+    bob.destroy();
+    await vi.waitFor(() => expect(docs.has('vsum:80')).toBe(false));
+    const loads = projects.loads.length;
+
+    // Alice's laptop wakes up and her tab reconnects with its old document.
+    alice.params.epoch = aliceEpoch;
+    const closed = nextCloseCode(alice);
+    alice.connect();
+
+    expect(await closed).toBe(4409);
+    alice.disconnect();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(projects.projects.get('80')?.metaModels.map((m) => m.sourceId)).toEqual([2]);
+    expect(projects.loads).toHaveLength(loads); // no room was created for her
+    expect(docs.has('vsum:80')).toBe(false);
+  });
+
+  it('are closed with 4409 while the project has a newer room, which keeps its state', async () => {
+    projects.add('81', { metaModels: [{ id: 101, sourceId: 1, name: 'A' }] });
+    const alice = await connect('vsum:81', 'owner');
+    const aliceEpoch = epochOf(alice.doc);
+    sleep(alice);
+    await vi.waitFor(() => expect(docs.has('vsum:81')).toBe(false));
+    const carol = await connect('vsum:81', 'member');
+    model(alice.doc, '1')?.set('name', 'Outdated name');
+
+    alice.params.epoch = aliceEpoch;
+    const closed = nextCloseCode(alice);
+    alice.connect();
+
+    expect(await closed).toBe(4409);
+    alice.disconnect();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(model(carol.doc, '1')?.get('name')).toBe('A');
+    expect(epochOf(carol.doc)).not.toBe(aliceEpoch);
+  });
+
+  it('keep the edits made offline if their room still exists', async () => {
+    projects.add('82', { metaModels: [{ id: 101, sourceId: 1, name: 'A' }] });
+    const alice = await connect('vsum:82', 'owner');
+    const bob = await connect('vsum:82', 'member');
+    sleep(alice);
+    model(alice.doc, '1')?.set('name', 'Renamed offline');
+
+    alice.params.epoch = epochOf(alice.doc);
+    alice.connect();
+
+    await vi.waitFor(() => expect(model(bob.doc, '1')?.get('name')).toBe('Renamed offline'));
+    await vi.waitFor(() => expect(projects.projects.get('82')?.metaModels[0].name).toBe('Renamed offline'));
+  });
+
+  it('are only checked after the access check', async () => {
+    projects.add('83');
+    await connect('vsum:83', 'owner');
+
+    await expect(rejectionStatus('/vsum:83?token=stranger&epoch=outdated')).resolves.toBe(403);
+    await expect(rejectionStatus('/vsum:84?token=invalid&epoch=outdated')).resolves.toBe(401);
+  });
+
+  it('are recognized by any epoch that is not the room\'s, also for a project without room', async () => {
+    projects.add('85');
+    await connect('vsum:85', 'owner');
+
+    for (const room of ['vsum:85', 'vsum:86']) {
+      const code = await new Promise<number>((resolve, reject) => {
+        const socket = new WebSocket(`${wsUrl}/${room}?token=owner&epoch=not-the-epoch`);
+        socket.on('close', (closeCode) => resolve(closeCode));
+        socket.on('error', reject);
+      });
+
+      expect(code).toBe(4409);
+    }
+    expect(projects.loads).not.toContain('86');
+  });
+
+  it('survive an invalid frame sent before the connection is closed', async () => {
+    const socket = new WebSocket(`${wsUrl}/vsum:88?token=owner&epoch=outdated`);
+    socket.on('error', () => {});
+    const closed = new Promise((resolve) => socket.once('close', resolve));
+    // Right on open, before the client answers the server's close.
+    socket.once('open', () => {
+      // A frame with RSV1 set, which ws rejects as invalid.
+      (socket as unknown as { _socket: { write(data: Buffer): void } })._socket.write(
+        Buffer.from([0xc2, 0x80, 1, 2, 3, 4]),
+      );
+    });
+    await closed;
+
+    expect((await fetch(`${httpUrl}/health`)).status).toBe(200);
+    const logged = vi.mocked(console.error).mock.calls.map((call) => call.join(' '));
+    expect(logged.some((line) => line.startsWith('A connection to vsum:88 failed:'))).toBe(true);
+  });
+
+  it('do not include an empty document: a client without epoch joins as before', async () => {
+    projects.add('87', { metaModels: [{ id: 101, sourceId: 1, name: 'A' }] });
+
+    const fresh = await connect('vsum:87', 'owner', new Y.Doc(), wsUrl, { epoch: '' });
+
+    expect(model(fresh.doc, '1')?.get('name')).toBe('A');
+  });
+});
+
 describe('reload notifications', () => {
   /** Sends the backend's notification that a project changed. */
   async function notify(path: string, authorization?: string, method = 'POST'): Promise<Response> {
@@ -752,6 +891,25 @@ describe('reload notifications', () => {
     await vi.waitFor(() => expect((models.get('1') as Y.Map<unknown>).get('name')).toBe('Vehicle'));
     expect(accessChecks()).toBe(checks);
     expect(client.wsconnected).toBe(true);
+  });
+
+  it('keep the epoch of the room, so a client that reconnects afterwards is not closed as outdated', async () => {
+    projects.add('72', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const alice = await connect('vsum:72', 'owner');
+    const bob = await connect('vsum:72', 'member'); // keeps the room open
+    const epoch = String(alice.doc.getMap('status').get('epoch'));
+    const nameIn = (doc: Y.Doc) => (doc.getMap('models').get('1') as Y.Map<unknown>).get('name');
+    alice.disconnect();
+    projects.projects.get('72')!.metaModels[0].name = 'Vehicle';
+
+    await notify('/internal/projects/72/reload', await backendToken());
+    await vi.waitFor(() => expect(nameIn(bob.doc)).toBe('Vehicle'));
+    alice.params.epoch = epoch;
+    alice.connect();
+
+    await vi.waitFor(() => expect(nameIn(alice.doc)).toBe('Vehicle'));
+    expect(alice.wsconnected).toBe(true);
+    expect(String(bob.doc.getMap('status').get('epoch'))).toBe(epoch);
   });
 
   it('do nothing for a project nobody has open', async () => {

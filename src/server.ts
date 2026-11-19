@@ -8,7 +8,8 @@ import { BackendError, type BackendClient } from './backend.js';
 import { TokenError, type BackendTokenVerifier } from './backendToken.js';
 import { describeError } from './errors.js';
 import { makeReadOnly } from './readOnly.js';
-import { createRooms, RoomsClosedError, type JoinedRoom } from './rooms.js';
+import { EPOCH_PARAM, OUTDATED_DOCUMENT_CLOSE_CODE } from './document.js';
+import { createRooms, OutdatedDocumentError, RoomsClosedError, type JoinedRoom } from './rooms.js';
 import type { WritebackTimings } from './writeback.js';
 
 /**
@@ -41,11 +42,13 @@ export interface CollaborationServer {
   close(): Promise<void>;
 }
 
-/** The room a connection may join and the role of its user there. */
+/** The room a connection may join, the role of its user there and the epoch of its document. */
 interface Access {
   roomName: string;
   projectId: string;
   role: Role;
+  /** The epoch the client sent; `undefined` for an empty document. */
+  epoch: string | undefined;
 }
 
 /**
@@ -59,6 +62,10 @@ interface Access {
  *   Users without access are rejected, and viewers can read but not change the document.
  * - The first connection to a room loads the project into the document; the connection is accepted
  *   once that is done. The users' changes are written back to the backend (see `rooms.ts`).
+ * - A client with a document sends its epoch (`?token=...&epoch=...`). If that isn't the current
+ *   room's epoch, or the project has no room, its document is outdated: the connection is accepted
+ *   and closed with code `4409` without joining or loading the room, so nothing of the document
+ *   reaches it. Browsers can read close codes, but not the status of a rejected handshake.
  * - `POST /internal/projects/{id}/reload`, called by the backend with its service account's token,
  *   reloads the project's room after the backend changed the project outside the document. It
  *   answers `202` once the reload started, also if the project has no room.
@@ -111,8 +118,17 @@ export function createCollaborationServer(options: CollaborationServerOptions): 
   });
 
   async function connect(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
-    const { roomName, projectId, role } = await checkAccess(request, options);
-    const room = await joinRoom(roomName, projectId);
+    const { roomName, projectId, role, epoch } = await checkAccess(request, options);
+    let room: JoinedRoom;
+    try {
+      room = await joinRoom(roomName, projectId, epoch);
+    } catch (error) {
+      if (!(error instanceof OutdatedDocumentError)) {
+        throw error;
+      }
+      closeOutdated(request, socket, head, roomName);
+      return;
+    }
     // The raw socket closes in every case: when the WebSocket closes, and also when the upgrade
     // below is aborted without ever creating one (e.g. the client went away while loading).
     socket.once('close', room.release);
@@ -138,10 +154,35 @@ export function createCollaborationServer(options: CollaborationServerOptions): 
     });
   }
 
-  async function joinRoom(roomName: string, projectId: string): Promise<JoinedRoom> {
+  /** Accepts the connection of a client whose document is outdated and closes it with `4409`. */
+  function closeOutdated(
+    request: IncomingMessage,
+    socket: Duplex,
+    head: Buffer,
+    roomName: string,
+  ): void {
+    // ws destroys a socket that went away meanwhile instead of upgrading it.
+    webSockets.handleUpgrade(request, socket, head, (webSocket) => {
+      // Messages are never read: nothing of the outdated document reaches a room. Without an error
+      // listener, an invalid frame sent before the close would crash the server.
+      webSocket.on('error', (error) => {
+        console.error(`A connection to ${roomName} failed:`, error.message);
+      });
+      webSocket.close(OUTDATED_DOCUMENT_CLOSE_CODE, 'Outdated document');
+    });
+  }
+
+  async function joinRoom(
+    roomName: string,
+    projectId: string,
+    epoch: string | undefined,
+  ): Promise<JoinedRoom> {
     try {
-      return await rooms.join(roomName, projectId);
+      return await rooms.join(roomName, projectId, epoch);
     } catch (error) {
+      if (error instanceof OutdatedDocumentError) {
+        throw error;
+      }
       if (error instanceof RoomsClosedError) {
         throw new AccessError(503, error.message);
       }
@@ -204,15 +245,18 @@ export function createCollaborationServer(options: CollaborationServerOptions): 
 async function checkAccess(request: IncomingMessage, options: BackendOptions): Promise<Access> {
   let roomName: string;
   let token: string | null;
+  let epoch: string | undefined;
   try {
     const url = new URL(request.url ?? '/', 'http://localhost');
     roomName = decodeURIComponent(url.pathname.slice(1));
     token = url.searchParams.get('token');
+    // An empty document has no epoch yet; an empty parameter counts as none.
+    epoch = url.searchParams.get(EPOCH_PARAM) || undefined;
   } catch {
     throw new AccessError(400, 'The request URL is invalid');
   }
   const projectId = parseRoomName(roomName);
-  return { roomName, projectId, role: await fetchRole(projectId, token, options) };
+  return { roomName, projectId, epoch, role: await fetchRole(projectId, token, options) };
 }
 
 /** Answers the upgrade request with an HTTP error instead of opening a WebSocket connection. */

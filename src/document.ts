@@ -10,7 +10,7 @@ import type { Map as YMap, Text as YText } from 'yjs';
  * relations  key → { backendId, sourceId, targetId, reactionFileId, fineGranular, softDeleted, softDeletedVia }
  * views      key → { backendId, name, description, fileStorageId, metaModelIds, softDeleted, softDeletedVia }
  * layout     { metaModels: metaModelId → { x, y }, reactions: metaModelId → …, other stored keys }
- * status     { writebackError }
+ * status     { writebackError, epoch }
  * ```
  *
  * - Each of `models`, `relations` and `views` is a `Y.Map` whose values are `Y.Map`s with the
@@ -51,6 +51,16 @@ export const LAYOUT_META_MODELS = 'metaModels' satisfies keyof LayoutFields;
 export const LAYOUT_REACTIONS = 'reactions' satisfies keyof LayoutFields;
 /** Field of {@link STATUS} with the reason of the last failed writeback. See {@link StatusFields}. */
 export const WRITEBACK_ERROR = 'writebackError' satisfies keyof StatusFields;
+/** Field of {@link STATUS} that identifies the room the document belongs to. See {@link StatusFields}. */
+export const EPOCH = 'epoch' satisfies keyof StatusFields;
+
+/** URL parameter in which a client sends the {@link EPOCH} of its document when it connects. */
+export const EPOCH_PARAM = 'epoch';
+/**
+ * WebSocket close code with which the server closes the connection of a client whose document
+ * belongs to an earlier room of the project (see {@link StatusFields.epoch}).
+ */
+export const OUTDATED_DOCUMENT_CLOSE_CODE = 4409;
 
 /** Fields every element has. */
 export interface SoftDeletable {
@@ -129,4 +139,12 @@ export interface LayoutFields {
 export interface StatusFields {
   /** Why the last writeback failed; `null` after a successful one. */
   writebackError: string | null;
+  /**
+   * Random ID of the room, new each time the server creates the room (after everyone left, or after
+   * a restart). Clients send it as the `epoch` parameter when they reconnect with a document that
+   * isn't empty. If it isn't the current room's, the server closes the connection with code
+   * `4409` without taking anything from the document; the client then starts again with a new,
+   * empty document. Otherwise the outdated document would bring back what was deleted since.
+   */
+  epoch: string;
 }
