@@ -41,6 +41,18 @@ describe('loadConfig', () => {
     expect(load({ BACKEND_URL: 'https://backend.example/' }).backendUrl).toBe(
       'https://backend.example',
     );
+    expect(load({ BACKEND_URL: ' https://backend.example/api/// ' }).backendUrl).toBe(
+      'https://backend.example/api',
+    );
+  });
+
+  it('checks a BACKEND_URL with many slashes in linear time', () => {
+    // A backtracking pattern like /\/+$/ needs seconds for this; the check takes milliseconds.
+    const value = `http://backend.example${'/'.repeat(100_000)}x`;
+    const started = performance.now();
+
+    expect(load({ BACKEND_URL: value }).backendUrl).toBe(value);
+    expect(performance.now() - started).toBeLessThan(1000);
   });
 
   it.each(['backend', 'ftp://backend.example', 'localhost:9811'])(
