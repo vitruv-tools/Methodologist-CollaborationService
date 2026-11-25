@@ -4,7 +4,7 @@ Real-time collaboration server for the Vitruv Methodologist: syncs project edits
 
 Design: [vitruv-tools/Vitruv-UI-Methodologist#635](https://github.com/vitruv-tools/Vitruv-UI-Methodologist/issues/635)
 
-**Status:** in development. The server checks access, loads projects from the backend, writes changes back and reloads projects the backend changed. The frontend doesn't use it yet.
+**Status:** in development. The server checks access, loads projects from the backend, writes changes back, reloads projects the backend changed and closes projects the backend removed. The frontend doesn't use it yet.
 
 ## How it works
 
@@ -14,6 +14,7 @@ Design: [vitruv-tools/Vitruv-UI-Methodologist#635](https://github.com/vitruv-too
 - When the first user opens a project, the server loads it from the backend (`GET /api/internal/v1/vsums/{id}/details` with its own service account) into the room's document. Connections are accepted once that's done. If loading fails, the connection is rejected and that empty document is never written back; the next connection tries loading again.
 - Changes are written back automatically (`PUT /api/internal/v1/vsums/{id}/sync-changes`): 5 seconds after the last change, at the latest every 60 seconds, when the last user leaves and when the server stops. Each writeback sends the complete state; Postgres stays the source of truth. A failed writeback keeps the changes and is reported in the document's `status.writebackError`. It is retried with a growing delay if the backend failed or didn't answer; otherwise (e.g. `400`), it is tried again after the next change and when the last user leaves. An element the server can't read is reported the same way instead of being written back.
 - When the backend changes a project outside the document (version restore, `LinkMetaModelsPanel`, metamodel renames and ecore saves), it calls `POST /internal/projects/{id}/reload` with the token of its service account. The server checks the token against Keycloak's public keys (issuer `{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}`, realm role `methodologist-backend`) and answers `401` for a missing, invalid or expired token, `403` without the role, `400` for an invalid project ID and otherwise `202`. For an open project, it pauses the room's writeback right away, waits for a writeback that is already running, loads the project and applies only the differences to the document, so connected clients see the change without reconnecting. The backend wins: changes made in the document that weren't written back yet are dropped. If loading fails, it is retried with a growing delay, and nothing is written back until it succeeds. A project nobody has open needs nothing; a room nobody uses anymore is dropped.
+- When a project is moved to the trash or deleted, the backend calls `POST /internal/projects/{id}/close`, whose token is checked the same way. For an open project, the server first asks the backend whether it still has the project (`GET /api/internal/v1/vsums/{id}/details`). Only if that answers `404` does it drop the room, without writing it back (changes that weren't written back are lost), and close its connections with code `4410`. A notification that arrives late or twice, e.g. after the project was restored and opened again, leaves the room alone. The server answers `202`, or `503` if the backend couldn't be asked, so the backend sends the notification again. Reconnecting is rejected with `403` until the project is restored from the trash; then the next user loads it into a new room.
 - A room is dropped once its last user left and its changes are written back; a room whose changes the backend keeps rejecting stays in memory until a user fixes them or the server stops. Documents are kept in memory only, so changes from the last seconds before a crash are lost.
 - The document's layout (metamodels, relations, views, positions, status) is described in [`src/document.ts`](src/document.ts).
 - `GET /health` returns `200` with `{"status":"UP"}`.
@@ -37,7 +38,7 @@ The server reads its settings from environment variables (see `.env.example`), e
 |---|---|---|
 | `PORT` | `1234` | Port for HTTP and WebSocket connections |
 | `BACKEND_URL` | `http://localhost:9811` | Base URL of the backend |
-| `KEYCLOAK_URL` | (required) | Base URL of Keycloak, where the server gets the token of its service account and the keys that check the backend's tokens. Must be the URL the backend gets its token from (the token's issuer), otherwise reload notifications get `401` |
+| `KEYCLOAK_URL` | (required) | Base URL of Keycloak, where the server gets the token of its service account and the keys that check the backend's tokens. Must be the URL the backend gets its token from (the token's issuer), otherwise the backend's reload and close notifications get `401` |
 | `KEYCLOAK_REALM` | `methodologist` | Keycloak realm |
 | `KEYCLOAK_CLIENT_ID` | `collaboration-service` | Client of the service account |
 | `KEYCLOAK_CLIENT_SECRET` | (required) | Secret of that client |

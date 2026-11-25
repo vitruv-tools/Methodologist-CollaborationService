@@ -1,15 +1,21 @@
 import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, type WebSocket } from 'ws';
 import { setPersistence, setupWSConnection } from 'y-websocket/bin/utils';
 import { AccessError, fetchRole, parseRoomName, type BackendOptions, type Role } from './access.js';
 import { BackendError, type BackendClient } from './backend.js';
 import { TokenError, type BackendTokenVerifier } from './backendToken.js';
 import { describeError } from './errors.js';
 import { makeReadOnly } from './readOnly.js';
-import { EPOCH_PARAM, OUTDATED_DOCUMENT_CLOSE_CODE } from './document.js';
-import { createRooms, OutdatedDocumentError, RoomsClosedError, type JoinedRoom } from './rooms.js';
+import { EPOCH_PARAM, OUTDATED_DOCUMENT_CLOSE_CODE, PROJECT_REMOVED_CLOSE_CODE } from './document.js';
+import {
+  createRooms,
+  OutdatedDocumentError,
+  ProjectRemovedError,
+  RoomsClosedError,
+  type JoinedRoom,
+} from './rooms.js';
 import type { WritebackTimings } from './writeback.js';
 
 /**
@@ -24,7 +30,7 @@ export const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
 export interface CollaborationServerOptions extends BackendOptions {
   /** Client of the backend's internal endpoints, which loads projects and writes changes back. */
   backend: BackendClient;
-  /** Checks the token the backend sends its reload notifications with. */
+  /** Checks the token the backend sends its reload and close notifications with. */
   backendTokens: BackendTokenVerifier;
   /** Defaults to {@link DEFAULT_WRITEBACK_TIMINGS}. */
   writeback?: Partial<WritebackTimings>;
@@ -69,6 +75,11 @@ interface Access {
  * - `POST /internal/projects/{id}/reload`, called by the backend with its service account's token,
  *   reloads the project's room after the backend changed the project outside the document. It
  *   answers `202` once the reload started, also if the project has no room.
+ * - `POST /internal/projects/{id}/close`, called the same way after the project was moved to the
+ *   trash or deleted, drops the project's room without writing it back and closes its connections
+ *   with code `4410`, once the backend confirmed that it no longer has the project. It answers
+ *   `202`, also if the project has no room or the backend still has it (a late notification), and
+ *   `503` if the backend could not be asked, so the backend sends the notification again.
  *
  * Only one server per process: rooms are kept in y-websocket's module-wide `docs` map.
  */
@@ -81,12 +92,12 @@ export function createCollaborationServer(options: CollaborationServerOptions): 
   const webSockets = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_BYTES });
   /** Connections that wait for the backend's answer and are not WebSocket connections yet. */
   const waiting = new Set<Duplex>();
+  /** The room each joined connection uses; connections closed as outdated have none. */
+  const roomOfConnection = new WeakMap<WebSocket, string>();
   let closing = false;
 
   const httpServer = createServer((request, response) => {
-    handleHttpRequest(request, response, (projectId, authorization) =>
-      notifyReload(projectId, authorization),
-    );
+    handleHttpRequest(request, response, { reload: notifyReload, close: notifyClose });
   });
 
   /**
@@ -95,10 +106,46 @@ export function createCollaborationServer(options: CollaborationServerOptions): 
    * @throws TokenError if the token isn't the backend's, AccessError (`400`) if the ID is invalid
    */
   async function notifyReload(projectId: string, authorization: string | undefined): Promise<void> {
+    void rooms.reload(await checkNotification(projectId, authorization));
+  }
+
+  /**
+   * Handles the backend's notification that a project was moved to the trash or deleted.
+   *
+   * @throws TokenError if the token isn't the backend's, AccessError (`400`) if the ID is invalid
+   */
+  async function notifyClose(projectId: string, authorization: string | undefined): Promise<void> {
+    const roomName = await checkNotification(projectId, authorization);
+    let removed: boolean;
+    try {
+      removed = await rooms.remove(roomName);
+    } catch (error) {
+      throw new AccessError(503, `The removal could not be confirmed: ${describeError(error)}`);
+    }
+    if (!removed) {
+      return;
+    }
+    // Only after the room was dropped, so that the clients leaving start no writeback.
+    for (const client of webSockets.clients) {
+      if (roomOfConnection.get(client) === roomName) {
+        client.close(PROJECT_REMOVED_CLOSE_CODE, 'Project removed');
+      }
+    }
+  }
+
+  /**
+   * Checks a notification of the backend and returns the name of the project's room.
+   *
+   * @throws TokenError if the token isn't the backend's, AccessError (`400`) if the ID is invalid
+   */
+  async function checkNotification(
+    projectId: string,
+    authorization: string | undefined,
+  ): Promise<string> {
     await options.backendTokens.verify(authorization);
     const roomName = `vsum:${projectId}`;
     parseRoomName(roomName);
-    void rooms.reload(roomName);
+    return roomName;
   }
   httpServer.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     // Without a listener, a connection error while waiting for the backend would crash the server.
@@ -150,6 +197,7 @@ export function createCollaborationServer(options: CollaborationServerOptions): 
       if (role === 'VIEWER') {
         makeReadOnly(webSocket);
       }
+      roomOfConnection.set(webSocket, roomName);
       setupWSConnection(webSocket, request, { docName: roomName });
     });
   }
@@ -186,7 +234,10 @@ export function createCollaborationServer(options: CollaborationServerOptions): 
       if (error instanceof RoomsClosedError) {
         throw new AccessError(503, error.message);
       }
-      if (error instanceof BackendError && error.status === 404) {
+      if (
+        error instanceof ProjectRemovedError ||
+        (error instanceof BackendError && error.status === 404)
+      ) {
         throw new AccessError(403, 'The project does not exist');
       }
       throw new AccessError(503, `The project could not be loaded: ${describeError(error)}`);
@@ -274,12 +325,18 @@ function reject(socket: Duplex, error: unknown): void {
   );
 }
 
-const RELOAD_PATH = /^\/internal\/projects\/([^/]+)\/reload$/;
+/** The backend's notifications, by the last segment of their path. */
+type Notification = 'reload' | 'close';
+
+const NOTIFICATION_PATH = /^\/internal\/projects\/([^/]+)\/(reload|close)$/;
 
 function handleHttpRequest(
   request: IncomingMessage,
   response: ServerResponse,
-  reload: (projectId: string, authorization: string | undefined) => Promise<void>,
+  notifications: Record<
+    Notification,
+    (projectId: string, authorization: string | undefined) => Promise<void>
+  >,
 ): void {
   // The body isn't used; reading it lets the connection be reused.
   request.resume();
@@ -295,8 +352,8 @@ function handleHttpRequest(
     answer(response, 400, 'Bad request');
     return;
   }
-  const reloadMatch = RELOAD_PATH.exec(path);
-  if (reloadMatch === null) {
+  const match = NOTIFICATION_PATH.exec(path);
+  if (match === null) {
     answer(response, 404, 'Not found');
     return;
   }
@@ -304,13 +361,14 @@ function handleHttpRequest(
     answer(response, 405, 'Method not allowed', { Allow: 'POST' });
     return;
   }
+  const notification = match[2] as Notification;
   // Not decoded: a valid project ID has digits only, and anything else is rejected with 400.
-  reload(reloadMatch[1], request.headers.authorization).then(
-    () => answer(response, 202, 'Reloading'),
+  notifications[notification](match[1], request.headers.authorization).then(
+    () => answer(response, 202, notification === 'reload' ? 'Reloading' : 'Closed'),
     (error: unknown) => {
       const status = error instanceof TokenError || error instanceof AccessError ? error.status : 500;
       // Only the message is logged, never the header: it contains the token.
-      console.error('Rejected a reload notification:', describeError(error));
+      console.error(`Rejected a ${notification} notification:`, describeError(error));
       answer(response, status, STATUS_CODES[status] ?? 'Error', status === 401 ? { 'WWW-Authenticate': 'Bearer' } : {});
     },
   );
