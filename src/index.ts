@@ -16,7 +16,7 @@ const backend = createBackendClient({
   backendUrl: config.backendUrl,
   serviceToken: createServiceToken(config.keycloak),
 });
-// Checks the backend's reload notifications. Keycloak's keys are only fetched for the first one.
+// Checks the backend's reload and close notifications. Keycloak's keys are only fetched for the first one.
 const backendTokens = createBackendTokenVerifier({
   url: config.keycloak.url,
   realm: config.keycloak.realm,

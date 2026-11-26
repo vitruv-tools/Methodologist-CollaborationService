@@ -173,6 +173,28 @@ function rejectionStatus(pathAndQuery: string): Promise<number | undefined> {
   });
 }
 
+/** Resolves with the code of the next close of a provider's connection. */
+function nextCloseCode(provider: WebsocketProvider): Promise<number | undefined> {
+  return new Promise((resolve) => {
+    const onClose = (event: { code?: number } | null) => {
+      provider.off('connection-close', onClose);
+      resolve(event?.code);
+    };
+    provider.on('connection-close', onClose);
+  });
+}
+
+/** Sends a notification of the backend, e.g. that a project changed. */
+async function notify(path: string, authorization?: string, method = 'POST'): Promise<Response> {
+  return fetch(`${httpUrl}${path}`, {
+    method,
+    headers: authorization === undefined ? {} : { Authorization: authorization },
+  });
+}
+
+/** The header with a token of the backend's service account. */
+const backendToken = async () => `Bearer ${await keycloak.signToken({ roles: [BACKEND_ROLE] })}`;
+
 describe('HTTP', () => {
   it('answers GET /health with 200', async () => {
     const response = await fetch(`${httpUrl}/health`);
@@ -719,17 +741,6 @@ describe('outdated documents', () => {
   const epochOf = (doc: Y.Doc) => String(doc.getMap('status').get('epoch'));
   const model = (doc: Y.Doc, key: string) => doc.getMap('models').get(key) as Y.Map<unknown> | undefined;
 
-  /** Resolves with the code of the next close of a provider's connection. */
-  function nextCloseCode(provider: WebsocketProvider): Promise<number | undefined> {
-    return new Promise((resolve) => {
-      const onClose = (event: { code?: number } | null) => {
-        provider.off('connection-close', onClose);
-        resolve(event?.code);
-      };
-      provider.on('connection-close', onClose);
-    });
-  }
-
   /** Disconnects a client, keeping its document, like a laptop going to sleep. */
   function sleep(provider: WebsocketProvider): void {
     provider.disconnect();
@@ -854,14 +865,6 @@ describe('outdated documents', () => {
 });
 
 describe('reload notifications', () => {
-  /** Sends the backend's notification that a project changed. */
-  async function notify(path: string, authorization?: string, method = 'POST'): Promise<Response> {
-    return fetch(`${httpUrl}${path}`, {
-      method,
-      headers: authorization === undefined ? {} : { Authorization: authorization },
-    });
-  }
-
   /** Sends a request line as it is, without a client that would correct it; returns the status. */
   function rawStatus(requestLine: string): Promise<number> {
     return new Promise((resolve, reject) => {
@@ -875,7 +878,6 @@ describe('reload notifications', () => {
     });
   }
 
-  const backendToken = async () => `Bearer ${await keycloak.signToken({ roles: [BACKEND_ROLE] })}`;
   const accessChecks = () => backend.requests.length;
 
   it('bring a change made outside the document to connected clients, without reconnecting', async () => {
@@ -983,6 +985,118 @@ describe('reload notifications', () => {
 
     const logged = vi.mocked(console.error).mock.calls.flat().join(' ');
     expect(logged).toContain('Rejected a reload notification');
+    expect(logged).not.toContain(token);
+  });
+});
+
+describe('close notifications', () => {
+  it('close the connections of a removed project with 4410 and drop its room without writing it back', async () => {
+    projects.add('60', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    projects.add('61');
+    const alice = await connect('vsum:60', 'owner');
+    const bob = await connect('vsum:60', 'viewer');
+    const carol = await connect('vsum:61', 'owner'); // another project
+    const closes = [nextCloseCode(alice), nextCloseCode(bob)];
+    // The project is in the trash now: loading it or writing it back fails with 404.
+    projects.missing.add('60');
+    (alice.doc.getMap('models').get('1') as Y.Map<unknown>).set('name', 'Not saved yet');
+
+    const response = await notify('/internal/projects/60/close', await backendToken());
+    // A writeback that started before the close is allowed; none may start afterwards.
+    const requests = projects.requests.length;
+
+    expect(response.status).toBe(202);
+    expect(await Promise.all(closes)).toEqual([4410, 4410]);
+    alice.disconnect();
+    bob.disconnect();
+    expect(docs.has('vsum:60')).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 300)); // longer than the writeback delays
+    expect(projects.requests.slice(requests).filter((request) => request.projectId === '60')).toEqual([]);
+    expect(carol.wsconnected).toBe(true);
+    expect(docs.has('vsum:61')).toBe(true);
+  });
+
+  it('are ignored for a project the backend still has, e.g. one restored before a late notification', async () => {
+    projects.add('65', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const alice = await connect('vsum:65', 'owner');
+    const doc = docs.get('vsum:65');
+
+    const response = await notify('/internal/projects/65/close', await backendToken());
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(response.status).toBe(202);
+    expect(alice.wsconnected).toBe(true);
+    expect(docs.get('vsum:65')).toBe(doc);
+  });
+
+  it('are answered with 503 and keep the room if the backend cannot confirm the removal', async () => {
+    projects.add('66');
+    const alice = await connect('vsum:66', 'owner');
+    projects.nextLoads.push(new BackendError(503, 'The backend answered GET with status 503'));
+
+    const response = await notify('/internal/projects/66/close', await backendToken());
+
+    expect(response.status).toBe(503);
+    expect(alice.wsconnected).toBe(true);
+    expect(docs.has('vsum:66')).toBe(true);
+  });
+
+  it('reject a connection whose project was still loading with 403', async () => {
+    projects.add('62');
+    const loading = gate();
+    // The connection's load waits; the check whether the project is gone answers 404.
+    projects.nextLoads.push(loading.interruption, new BackendError(404, 'status 404'));
+    const rejected = rejectionStatus('/vsum:62?token=owner');
+    await vi.waitFor(() => expect(projects.loads).toContain('62'));
+
+    await notify('/internal/projects/62/close', await backendToken());
+    loading.open();
+
+    expect(await rejected).toBe(403);
+    expect(docs.has('vsum:62')).toBe(false);
+  });
+
+  it('let users open the project again once it was restored, in a new room', async () => {
+    projects.add('63', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const alice = await connect('vsum:63', 'owner');
+    const epoch = String(alice.doc.getMap('status').get('epoch'));
+    const closed = nextCloseCode(alice);
+    projects.missing.add('63');
+    await notify('/internal/projects/63/close', await backendToken());
+    await closed;
+    alice.disconnect();
+    projects.missing.delete('63'); // restored
+
+    const bob = await connect('vsum:63', 'member');
+
+    expect(String(bob.doc.getMap('status').get('epoch'))).not.toBe(epoch);
+    expect((bob.doc.getMap('models').get('1') as Y.Map<unknown>).get('name')).toBe('Car');
+  });
+
+  it('do nothing for a project nobody has open', async () => {
+    const loads = projects.loads.length;
+
+    const response = await notify('/internal/projects/64/close', await backendToken());
+
+    expect(response.status).toBe(202);
+    expect(projects.loads).toHaveLength(loads);
+  });
+
+  it('are rejected like reload notifications if the token or the project ID is invalid', async () => {
+    const userToken = `Bearer ${await keycloak.signToken({ roles: ['user'] })}`;
+
+    expect((await notify('/internal/projects/60/close')).status).toBe(401);
+    expect((await notify('/internal/projects/60/close', userToken)).status).toBe(403);
+    expect((await notify('/internal/projects/abc/close', await backendToken())).status).toBe(400);
+    expect((await notify('/internal/projects/60/close', await backendToken(), 'GET')).status).toBe(405);
+  });
+
+  it('never log the token', async () => {
+    const token = await keycloak.signToken({ roles: [BACKEND_ROLE], forged: true });
+    await notify('/internal/projects/60/close', `Bearer ${token}`);
+
+    const logged = vi.mocked(console.error).mock.calls.flat().join(' ');
+    expect(logged).toContain('Rejected a close notification');
     expect(logged).not.toContain(token);
   });
 });

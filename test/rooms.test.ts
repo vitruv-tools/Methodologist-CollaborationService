@@ -7,6 +7,7 @@ import {
   createRooms,
   isRetryable,
   OutdatedDocumentError,
+  ProjectRemovedError,
   RoomsClosedError,
   type Rooms,
 } from '../src/rooms.js';
@@ -844,5 +845,140 @@ describe('reloading', () => {
 
     expect(backend.requests).toEqual([]);
     expect(docs.has('vsum:1')).toBe(false);
+  });
+});
+
+describe('removing', () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  /** The project is in the trash or deleted: the backend answers `404` for it. */
+  const removeInBackend = () => backend.missing.add('1');
+  const nameIn = (doc: Doc) => (doc.getMap('models').get('1') as YMap<unknown>).get('name');
+
+  it('does nothing for a project without a room, without asking the backend', async () => {
+    expect(await rooms.remove('vsum:1')).toBe(false);
+
+    expect(backend.loads).toEqual([]);
+    expect(docs.has('vsum:1')).toBe(false);
+  });
+
+  it('drops the room once the backend confirmed the removal, and never writes back its changes', async () => {
+    const alice = await rooms.join('vsum:1', '1');
+    const bob = await rooms.join('vsum:1', '1');
+    rename(alice.doc, 'Not saved yet');
+    removeInBackend();
+
+    expect(await rooms.remove('vsum:1')).toBe(true);
+    expect(docs.has('vsum:1')).toBe(false);
+    alice.release();
+    bob.release();
+    await sleep(300); // longer than the debounce delay and the maximum wait
+
+    expect(backend.requests).toEqual([]);
+    expect(backend.loads).toEqual(['1', '1']); // opening, then asking whether it is gone
+    expect(storedName()).toBe('Car');
+  });
+
+  it('keeps the room of a project the backend still has, e.g. a late notification after a restore', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    rename(doc, 'Mine');
+
+    expect(await rooms.remove('vsum:1')).toBe(false);
+
+    expect(docs.get('vsum:1')).toBe(doc);
+    await vi.waitFor(() => expect(storedName()).toBe('Mine')); // still written back
+  });
+
+  it('keeps the room if the backend cannot be asked', async () => {
+    const { doc } = await rooms.join('vsum:1', '1');
+    backend.nextLoads.push(new BackendError(503, 'status 503'));
+
+    await expect(rooms.remove('vsum:1')).rejects.toThrow(BackendError);
+
+    expect(docs.get('vsum:1')).toBe(doc);
+  });
+
+  it('does not retry a writeback that was running and failed', async () => {
+    const { doc, release } = await rooms.join('vsum:1', '1');
+    let openGate = () => {};
+    const saving = new Promise<void>((resolve) => (openGate = resolve));
+    const send = backend.syncChanges.bind(backend);
+    // Every writeback waits for the gate, then fails as if the backend had failed: that is retried.
+    backend.syncChanges = async (projectId, changes) => {
+      await send(projectId, changes);
+      await saving;
+      throw new BackendError(503, 'status 503');
+    };
+    rename(doc, 'Mine');
+    await vi.waitFor(() => expect(backend.requests).toHaveLength(1));
+    removeInBackend();
+
+    expect(await rooms.remove('vsum:1')).toBe(true);
+    openGate();
+    release();
+    await sleep(300); // several retry delays
+
+    expect(backend.requests).toHaveLength(1);
+    expect(backend.loads).toHaveLength(2); // opening, then the check
+  });
+
+  it('drops a room that was kept because the backend rejected its changes', async () => {
+    backend.nextSyncs.push(new BackendError(400, 'status 400'), new BackendError(400, 'status 400'));
+    const alice = await rooms.join('vsum:1', '1');
+    rename(alice.doc, 'Rejected');
+    await vi.waitFor(() => expect(writebackError(alice.doc)).not.toBeNull());
+    alice.release(); // tries the rejected writeback once more
+    await vi.waitFor(() => expect(backend.requests).toHaveLength(2));
+    expect(docs.has('vsum:1')).toBe(true);
+    removeInBackend();
+
+    expect(await rooms.remove('vsum:1')).toBe(true);
+
+    expect(docs.has('vsum:1')).toBe(false);
+    expect(backend.requests).toHaveLength(2);
+  });
+
+  it('rejects users whose project was still loading', async () => {
+    const loading = gate();
+    // The join's load waits; the check whether the project is gone answers 404.
+    backend.nextLoads.push(loading.interruption, new BackendError(404, 'status 404'));
+    const joining = rooms.join('vsum:1', '1');
+
+    expect(await rooms.remove('vsum:1')).toBe(true);
+    loading.open();
+
+    await expect(joining).rejects.toThrow(ProjectRemovedError);
+    expect(docs.has('vsum:1')).toBe(false);
+  });
+
+  it('stops a running reload without writing anything back', async () => {
+    rooms = createRooms({ backend, writeback: { ...TIMINGS, minRetryDelayMs: 60_000, maxRetryDelayMs: 60_000 } });
+    const { doc, release } = await rooms.join('vsum:1', '1');
+    rename(doc, 'Mine');
+    removeInBackend();
+    const reloading = rooms.reload('vsum:1');
+    await vi.waitFor(() => expect(backend.loads).toHaveLength(2)); // failed, waits 60 s
+
+    expect(await rooms.remove('vsum:1')).toBe(true);
+    await reloading;
+    release();
+    await sleep(100);
+
+    expect(backend.loads).toHaveLength(3); // opening, the failed reload, the check
+    expect(backend.requests).toEqual([]);
+  });
+
+  it('lets the next user open a new room, e.g. after the project was restored from the trash', async () => {
+    const alice = await rooms.join('vsum:1', '1');
+    const epoch = alice.doc.getMap('status').get('epoch');
+    removeInBackend();
+    await rooms.remove('vsum:1');
+    alice.release();
+    backend.missing.delete('1'); // restored
+
+    const bob = await rooms.join('vsum:1', '1');
+
+    expect(bob.doc).not.toBe(alice.doc);
+    expect(bob.doc.getMap('status').get('epoch')).not.toBe(epoch);
+    expect(nameIn(bob.doc)).toBe('Car');
   });
 });

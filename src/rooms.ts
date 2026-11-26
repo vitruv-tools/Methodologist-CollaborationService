@@ -45,6 +45,7 @@ export interface Rooms {
    * @throws BackendError or ServiceTokenError if loading the project failed
    * @throws RoomsClosedError if the rooms are being closed
    * @throws OutdatedDocumentError if `epoch` is given but isn't the current room's
+   * @throws ProjectRemovedError if the project was removed while it was loading
    */
   join(roomName: string, projectId: string, epoch?: string): Promise<JoinedRoom>;
   /**
@@ -68,6 +69,25 @@ export interface Rooms {
    * done; never rejects.
    */
   reload(roomName: string): Promise<void>;
+  /**
+   * Drops the room of a project that was moved to the trash or deleted, without writing it back:
+   * the backend has no project to write it to anymore, so changes that weren't written back are
+   * lost. A running reload stops, and users whose join is still loading the project are rejected
+   * with {@link ProjectRemovedError}.
+   *
+   * The backend is asked for the project first, and the room is dropped only if it answers `404`.
+   * So a notification that arrives late or twice, e.g. after the project was restored from the
+   * trash and opened again, leaves the room alone. Does nothing, without asking the backend, if the
+   * project has no room.
+   *
+   * The connections still using a dropped room must be closed by the caller; their joins must still
+   * be released. The next join opens a new room, e.g. after the project was restored.
+   *
+   * Resolves with whether a room was dropped.
+   *
+   * @throws BackendError or ServiceTokenError if the backend could not be asked; the room is kept
+   */
+  remove(roomName: string): Promise<boolean>;
 }
 
 /**
@@ -89,6 +109,14 @@ export class RoomsClosedError extends Error {
   }
 }
 
+/** Thrown by {@link Rooms.join} if the project was removed while it was loading. */
+export class ProjectRemovedError extends Error {
+  constructor() {
+    super('The project was removed');
+    this.name = 'ProjectRemovedError';
+  }
+}
+
 interface Room {
   readonly name: string;
   readonly projectId: string;
@@ -101,6 +129,8 @@ interface Room {
   /** Number of joins that are not released yet. */
   users: number;
   dropped: boolean;
+  /** Whether the room was dropped because its project was removed, see {@link Rooms.remove}. */
+  removed: boolean;
   writeback?: Writeback;
   /** The project as the backend returned it last. */
   known?: ProjectDetails;
@@ -153,6 +183,7 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
       isLoaded: false,
       users: 0,
       dropped: false,
+      removed: false,
       reloadRequested: false,
     };
     room.loaded = backend
@@ -169,7 +200,7 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
   /** Fills the document with the loaded project and starts writing its changes back. */
   function loaded(room: Room, project: ProjectDetails): void {
     if (room.dropped) {
-      throw new RoomsClosedError();
+      throw room.removed ? new ProjectRemovedError() : new RoomsClosedError();
     }
     const skipped = fillDocument(room.doc, project);
     room.doc.transact(() => room.doc.getMap(STATUS).set(EPOCH, room.epoch), SERVER_ORIGIN);
@@ -272,6 +303,19 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
     room.doc.destroy();
   }
 
+  /** Asks the backend whether it still has the project. Only `404` counts as not having it. */
+  async function projectExists(projectId: string): Promise<boolean> {
+    try {
+      await backend.getProject(projectId);
+      return true;
+    } catch (error) {
+      if (error instanceof BackendError && error.status === 404) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
   /** Reloads the room's project as long as that is requested; see {@link Rooms.reload}. */
   async function runReload(room: Room): Promise<void> {
     try {
@@ -353,6 +397,22 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
       room.reloadRequested = true;
       room.reloading ??= runReload(room);
       return room.reloading;
+    },
+
+    async remove(roomName) {
+      const room = rooms.get(roomName);
+      if (room === undefined || (await projectExists(room.projectId))) {
+        return false;
+      }
+      // The room may have been dropped, or replaced by a new one, meanwhile.
+      const current = rooms.get(roomName);
+      if (current === undefined) {
+        return false;
+      }
+      current.removed = true;
+      // Disposes the writeback, so the users leaving afterwards start none.
+      drop(current);
+      return true;
     },
 
     async join(roomName, projectId, epoch) {
