@@ -107,6 +107,78 @@ describe('timing', () => {
   });
 });
 
+describe('a change that must not wait', () => {
+  it('is written right away, without the debounce delay', async () => {
+    writeback.markChanged({ now: true });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(writes).toBe(1);
+    expect(writeback.hasChanges).toBe(false);
+  });
+
+  it('is written right away also while other changes keep postponing the write', async () => {
+    writeback.markChanged();
+    await vi.advanceTimersByTimeAsync(4000);
+    writeback.markChanged({ now: true });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(writes).toBe(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(writes).toBe(1);
+  });
+
+  it('is written right after a running write, with the next write', async () => {
+    const open = slowWrite();
+    writeback.markChanged({ now: true });
+    await vi.advanceTimersByTimeAsync(0);
+    writeback.markChanged({ now: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(writes).toBe(1);
+
+    open();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(writes).toBe(2);
+    expect(writeback.hasChanges).toBe(false);
+  });
+
+  it('does not shorten the delay before a failed write is retried', async () => {
+    results.push(new Retryable());
+    writeback.markChanged({ now: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(failures).toEqual([[expect.any(Retryable), 1000]]);
+
+    writeback.markChanged({ now: true });
+    await vi.advanceTimersByTimeAsync(999);
+    expect(writes).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(writes).toBe(2);
+  });
+
+  it('is written again after a write that was rejected', async () => {
+    results.push(new Rejected());
+    writeback.markChanged({ now: true });
+    await vi.advanceTimersByTimeAsync(0);
+
+    writeback.markChanged({ now: true });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(writes).toBe(2);
+  });
+
+  it('is not written while paused, and after resume like any other change', async () => {
+    await writeback.pause();
+    writeback.markChanged({ now: true });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(writes).toBe(0);
+
+    writeback.resume({ discardChanges: false });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(writes).toBe(1);
+  });
+});
+
 describe('one write at a time', () => {
   it('writes changes made during a write with the next write', async () => {
     writeback.markChanged();

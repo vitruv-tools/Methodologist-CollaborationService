@@ -7,6 +7,7 @@ import {
   applyProject,
   DocumentError,
   fillDocument,
+  onAddedMetaModel,
   SERVER_ORIGIN,
   setWritebackError,
   toSyncChanges,
@@ -154,7 +155,8 @@ interface Room {
  * - Nobody gets the document before it is loaded. If loading fails, the document is dropped
  *   without ever being written back, since an empty document would delete the project.
  * - Changes from clients start a writeback of the room's {@link Writeback}; the server's own
- *   changes (origin {@link SERVER_ORIGIN}) don't.
+ *   changes (origin {@link SERVER_ORIGIN}) don't. A change that adds or restores a metamodel is
+ *   written back right away, so the backend makes the project's copy, whose IDs other users need.
  * - When the last user leaves, the changes are written back. The room is dropped only once
  *   everything is written back, so a user who comes back meanwhile gets the same document. A room
  *   whose changes the backend rejected (and rejects again when the last user leaves) stays in
@@ -218,9 +220,15 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
       onFailure: (error, retryInMs) => reportFailure(room, error, retryInMs),
       onSettled: () => dropIfDone(room),
     });
+    // Yjs calls observers before it emits the change's update, so the flag belongs to that update.
+    let addsMetaModel = false;
+    onAddedMetaModel(room.doc, () => (addsMetaModel = true));
     room.doc.on('update', (_update: Uint8Array, origin: unknown) => {
+      const now = addsMetaModel;
+      addsMetaModel = false;
       if (origin !== SERVER_ORIGIN) {
-        room.writeback?.markChanged();
+        // Other users can show a new metamodel only once the backend made the project's copy.
+        room.writeback?.markChanged({ now });
       }
     });
     room.isLoaded = true;

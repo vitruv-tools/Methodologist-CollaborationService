@@ -11,6 +11,9 @@ interface StoredModel {
   id: number;
   sourceId: number;
   name: string;
+  /** Files of the project's copy; a copy made by a sync request gets new ones. */
+  ecoreFileId?: number;
+  genModelFileId?: number;
 }
 
 interface StoredView {
@@ -150,7 +153,13 @@ export class FakeProjects implements BackendClient {
       }
       const model = project.metaModels.find((candidate) => candidate.sourceId === sourceId);
       if (model === undefined) {
-        project.metaModels.push({ id: this.nextId++, sourceId, name: name ?? `Model ${sourceId}` });
+        project.metaModels.push({
+          id: this.nextId++,
+          sourceId,
+          name: name ?? `Model ${sourceId}`,
+          ecoreFileId: this.nextId++,
+          genModelFileId: this.nextId++,
+        });
         log.push(`add model ${sourceId}`);
       } else if (name !== undefined && name !== model.name) {
         model.name = name;

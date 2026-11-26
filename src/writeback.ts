@@ -34,8 +34,13 @@ export interface WritebackOptions extends Partial<WritebackTimings> {
 
 /** Writes the changes of one document back, at most one write at a time. */
 export interface Writeback {
-  /** Records a change, which is written back after the debounce delay or the maximum wait. */
-  markChanged(): void;
+  /**
+   * Records a change, which is written back after the debounce delay or the maximum wait. With
+   * `now`, it is written right away instead, or right after a running write, e.g. a new metamodel
+   * that other users can only show once the backend has it. A failed write is still retried only
+   * after its delay, and nothing is written while paused.
+   */
+  markChanged(options?: { now?: boolean }): void;
   /**
    * Writes the changes back now instead of waiting, e.g. when the last user left. Waits for a
    * running write first, and resolves when everything is written or the write failed. With
@@ -180,13 +185,17 @@ export function createWriteback(options: WritebackOptions): Writeback {
   }
 
   return {
-    markChanged() {
+    markChanged({ now = false } = {}) {
       if (disposed) {
         return;
       }
       version += 1;
       blocked = false;
-      schedule();
+      if (now && retryTimer === undefined) {
+        writeNow(true);
+      } else {
+        schedule();
+      }
     },
     async flush({ retry = true, force = false } = {}) {
       while (running !== undefined) {
