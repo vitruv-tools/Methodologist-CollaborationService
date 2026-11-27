@@ -9,9 +9,15 @@ export interface FakeBackend {
   close(): Promise<void>;
 }
 
-/** Answer of the real backend for a user with the given role. */
-export function details(role: string): FakeAnswer {
-  return { status: 200, body: { data: { id: 1, name: 'Project', role, metaModels: [] }, message: null } };
+/**
+ * Answer of the real backend for a user with the given role and ID. `undefined` leaves the ID out,
+ * like a backend that doesn't send it yet.
+ */
+export function details(role: string, userId: unknown): FakeAnswer {
+  return {
+    status: 200,
+    body: { data: { id: 1, name: 'Project', role, userId, metaModels: [] }, message: null },
+  };
 }
 
 /**

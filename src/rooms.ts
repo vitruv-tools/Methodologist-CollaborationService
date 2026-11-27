@@ -30,6 +30,13 @@ export interface RoomsOptions {
 /** A room a connection uses: the shared document of one project. */
 export interface JoinedRoom {
   readonly doc: WSSharedDoc;
+  /**
+   * Whether the room was dropped since it was joined, e.g. because its project was removed (see
+   * {@link Rooms.remove}); a later join gets a new room. A connection must not be set up for a
+   * dropped room: y-websocket would give it the document it has under the room's name now, a new
+   * one that no room loads or writes back, or the new room's.
+   */
+  readonly dropped: boolean;
   /** Ends this use of the room. Further calls do nothing. */
   release(): void;
 }
@@ -81,7 +88,8 @@ export interface Rooms {
    * project has no room.
    *
    * The connections still using a dropped room must be closed by the caller; their joins must still
-   * be released. The next join opens a new room, e.g. after the project was restored.
+   * be released. Joins whose connection isn't set up yet see it in {@link JoinedRoom.dropped}. The
+   * next join opens a new room, e.g. after the project was restored.
    *
    * Resolves with whether a room was dropped.
    *
@@ -443,7 +451,13 @@ export function createRooms({ backend, writeback: timings }: RoomsOptions): Room
         release();
         throw error;
       }
-      return { doc: joined.doc, release };
+      return {
+        doc: joined.doc,
+        get dropped() {
+          return joined.dropped;
+        },
+        release,
+      };
     },
 
     async closeAll(timeoutMs) {

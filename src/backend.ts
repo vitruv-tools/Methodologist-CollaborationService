@@ -1,3 +1,4 @@
+import { isRole, type Role } from './access.js';
 import { describeError } from './errors.js';
 import type { ServiceToken } from './serviceToken.js';
 
@@ -124,6 +125,16 @@ export interface BackendClient {
    * @throws ServiceTokenError if no token can be got from Keycloak
    */
   syncChanges(projectId: string, changes: SyncChanges): Promise<void>;
+  /**
+   * Loads the role of every active user of a project, by the user's ID as a decimal string (the
+   * same IDs as in `GET /api/v1/vsums/{id}/details`). Users not in the map have no access.
+   *
+   * @throws BackendError with status `404` if the project doesn't exist or is in the trash; also
+   *     if the backend fails, answers with another error or answers with an invalid list, which is
+   *     never taken as an empty one
+   * @throws ServiceTokenError if no token can be got from Keycloak
+   */
+  getMembers(projectId: string): Promise<Map<string, Role>>;
 }
 
 export interface BackendClientOptions {
@@ -173,6 +184,22 @@ export function createBackendClient(options: BackendClientOptions): BackendClien
     },
     async syncChanges(projectId, changes) {
       await send('PUT', `${projectPath(projectId)}/sync-changes`, changes);
+    },
+    async getMembers(projectId) {
+      const body = await send('GET', `${projectPath(projectId)}/members`);
+      const list = (body as { data?: unknown } | undefined)?.data;
+      if (!Array.isArray(list)) {
+        throw new BackendError(200, `The backend answered without the members of project ${projectId}`);
+      }
+      const members = new Map<string, Role>();
+      for (const entry of list) {
+        const { userId, role } = (entry ?? {}) as { userId?: unknown; role?: unknown };
+        if (typeof userId !== 'number' || !Number.isSafeInteger(userId) || userId < 0 || !isRole(role)) {
+          throw new BackendError(200, `The backend answered with an invalid member of project ${projectId}`);
+        }
+        members.set(String(userId), role);
+      }
+      return members;
     },
   };
 }

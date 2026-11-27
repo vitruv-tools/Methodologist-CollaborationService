@@ -107,6 +107,73 @@ describe('internal endpoints', () => {
   });
 });
 
+describe('members', () => {
+  const MEMBERS = [
+    { userId: 7, role: 'OWNER' },
+    { userId: 9, role: 'MEMBER' },
+    { userId: 12, role: 'VIEWER' },
+  ];
+
+  beforeEach(() => {
+    answer = () => ({ status: 200, body: { data: MEMBERS, message: null } });
+  });
+
+  it('are loaded with the service token, with the user IDs as strings', async () => {
+    const members = await client.getMembers('7');
+
+    expect(members).toEqual(new Map([['7', 'OWNER'], ['9', 'MEMBER'], ['12', 'VIEWER']]));
+    expect(backend.requests).toMatchObject([
+      { method: 'GET', path: '/api/internal/v1/vsums/7/members', authorization: 'Bearer token-1' },
+    ]);
+  });
+
+  it('are an empty map for a project without active users', async () => {
+    answer = () => ({ status: 200, body: { data: [], message: null } });
+
+    expect(await client.getMembers('7')).toEqual(new Map());
+  });
+
+  it('are loaded with a new token once if the backend rejects the token', async () => {
+    accepted = new Set(['token-2']);
+
+    expect(await client.getMembers('7')).toHaveProperty('size', 3);
+
+    expect(backend.requests.map((request) => request.authorization)).toEqual([
+      'Bearer token-1',
+      'Bearer token-2',
+    ]);
+  });
+
+  it('fail with 404 for a project the backend does not have or has in the trash', async () => {
+    answer = () => ({ status: 404 });
+
+    const error = await failure(client.getMembers('7'));
+
+    expect(error).toBeInstanceOf(BackendError);
+    expect((error as BackendError).status).toBe(404);
+  });
+
+  it.each([
+    ['without data', { message: null }],
+    ['with data that is no list', { data: { userId: 7, role: 'OWNER' } }],
+    ['with null instead of a member', { data: [null] }],
+    ['with an unknown role', { data: [{ userId: 7, role: 'ADMIN' }] }],
+    ['without a role', { data: [{ userId: 7 }] }],
+    ['with a user ID that is a string', { data: [{ userId: '7', role: 'OWNER' }] }],
+    ['with a user ID that is no integer', { data: [{ userId: 7.5, role: 'OWNER' }] }],
+    ['with a negative user ID', { data: [{ userId: -7, role: 'OWNER' }] }],
+    ['with a user ID beyond the safe integers', { data: [{ userId: 2 ** 53, role: 'OWNER' }] }],
+    ['with one invalid member among valid ones', { data: [...MEMBERS, { role: 'MEMBER' }] }],
+  ])('fail, instead of being empty, if the backend answers %s', async (_case, body) => {
+    answer = () => ({ status: 200, body });
+
+    const error = await failure(client.getMembers('7'));
+
+    expect(error).toBeInstanceOf(BackendError);
+    expect((error as BackendError).status).toBe(200);
+  });
+});
+
 describe('a rejected token', () => {
   it('is renewed, and the request is retried once', async () => {
     accepted = new Set(['token-2']);

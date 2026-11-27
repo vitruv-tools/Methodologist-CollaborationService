@@ -7,6 +7,8 @@ declare module 'y-websocket/bin/utils' {
   /** The document of a room, shared by all its connections. */
   export class WSSharedDoc extends Doc {
     readonly name: string;
+    /** The room's connections, each with the IDs of the awareness states it controls. */
+    readonly conns: Map<WebSocket, Set<number>>;
   }
 
   /** The documents of all rooms, by room name. */

@@ -9,7 +9,7 @@ export interface Config {
   backendUrl: string;
   /**
    * Login of the collaboration server's own service account. The same Keycloak's public keys check
-   * the tokens of the backend's reload notifications.
+   * the tokens of the backend's notifications (reload, close and check-access).
    */
   keycloak: KeycloakConfig;
 }

@@ -2,7 +2,7 @@ import { connect as connectTcp } from 'node:net';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { WebsocketProvider } from 'y-websocket';
-import { docs, setPersistence } from 'y-websocket/bin/utils';
+import { docs, setPersistence, type WSSharedDoc } from 'y-websocket/bin/utils';
 import * as Y from 'yjs';
 import { BackendError } from '../src/backend.js';
 import { BACKEND_ROLE, createBackendTokenVerifier, type BackendTokenVerifier } from '../src/backendToken.js';
@@ -16,15 +16,30 @@ import { REALM, startFakeKeycloak, type FakeKeycloak } from './fakeKeycloak.js';
 import { FakeProjects, gate } from './fakeProjects.js';
 
 /**
- * The fake backend knows these tokens. `owner`, `member` and `viewer` have that role in every
- * project except project 404, which doesn't exist. The other tokens trigger the named problem.
+ * The backend's IDs of the users of the tokens. `member-renewed` is another token of `member`,
+ * e.g. of a tab that reconnected after the first token expired.
+ */
+const USERS = { owner: '1', member: '2', 'member-renewed': '2', viewer: '3', member2: '4' } as const;
+
+/**
+ * The fake backend knows these tokens. `owner`, `member`, `viewer` and `member2` (another member)
+ * have that role in every project except project 404, which doesn't exist, as long as a test
+ * doesn't change the project's members (`projects.membersOf`). A user who is no member gets `403`.
+ * The other tokens trigger the named problem.
  */
 function answer(token: string | undefined, projectId: string): FakeAnswer {
   switch (token) {
     case 'owner':
     case 'member':
+    case 'member-renewed':
     case 'viewer':
-      return projectId === '404' ? { status: 404 } : details(token.toUpperCase());
+    case 'member2': {
+      if (projectId === '404') {
+        return { status: 404 };
+      }
+      const role = projects.membersOf(projectId).get(USERS[token]);
+      return role === undefined ? { status: 403 } : details(role, Number(USERS[token]));
+    }
     case 'stranger':
       return { status: 403 };
     case 'broken':
@@ -36,14 +51,60 @@ function answer(token: string | undefined, projectId: string): FakeAnswer {
     case 'no-role':
       return { status: 200, body: { data: {} } };
     case 'unknown-role':
-      return details('ADMIN');
+      return details('ADMIN', 1);
+    case 'no-user-id':
+      return details('OWNER', undefined);
+    case 'text-user-id':
+      return details('OWNER', '1');
+    case 'fractional-user-id':
+      return details('OWNER', 1.5);
+    case 'negative-user-id':
+      return details('OWNER', -1);
+    case 'unsafe-user-id':
+      return details('OWNER', 2 ** 53);
     default:
       return { status: 401 };
   }
 }
 
+/** Answers held back by {@link holdAccess}, in order. */
+const accessHolds: { projectId: string; arrived: () => void; released: Promise<void> }[] = [];
+
+/**
+ * Holds back the fake backend's next answer about a user's access to the project. Like the real
+ * backend's, it is computed when the backend is asked, e.g. before the user is removed, and sent
+ * once `open` is called. `requested` resolves once the backend was asked. The server waits for an
+ * answer only 300 ms (`backendTimeoutMs`).
+ */
+function holdAccess(projectId: string): { requested: Promise<void>; open: () => void } {
+  let arrived = () => {};
+  const requested = new Promise<void>((resolve) => {
+    arrived = resolve;
+  });
+  let open = () => {};
+  const released = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  accessHolds.push({ projectId, arrived, released });
+  return { requested, open };
+}
+
+/** Like {@link answer}, but held back if {@link holdAccess} asked for that. */
+function answerOrHold(token: string | undefined, projectId: string): FakeAnswer {
+  const result = answer(token, projectId);
+  const index = accessHolds.findIndex((hold) => hold.projectId === projectId);
+  if (index === -1 || result === 'hang') {
+    return result;
+  }
+  const [hold] = accessHolds.splice(index, 1);
+  hold.arrived();
+  return { ...result, after: hold.released };
+}
+
 /** Short delays, so that tests don't wait 5 seconds for a writeback. */
 const TIMINGS = { debounceMs: 20, maxWaitMs: 200, minRetryDelayMs: 10, maxRetryDelayMs: 40 };
+/** How long a client may take to complete a close of the server before it is terminated. */
+const REVOKED_CLOSE_TIMEOUT_MS = 200;
 
 let backend: FakeBackend;
 /** Issues the backend's tokens for reload notifications. */
@@ -57,7 +118,7 @@ let wsUrl: string;
 const providers: WebsocketProvider[] = [];
 
 beforeAll(async () => {
-  backend = await startFakeBackend(answer);
+  backend = await startFakeBackend(answerOrHold);
   keycloak = await startFakeKeycloak();
   backendTokens = createBackendTokenVerifier({ url: keycloak.url, realm: REALM, timeoutMs: 300 });
   projects = new FakeProjects();
@@ -67,18 +128,22 @@ beforeAll(async () => {
     backend: projects,
     backendTokens,
     writeback: TIMINGS,
+    revokedCloseTimeoutMs: REVOKED_CLOSE_TIMEOUT_MS,
   });
   const port = await server.listen(0);
   httpUrl = `http://localhost:${port}`;
   wsUrl = `ws://localhost:${port}`;
   // Rejections caused by the backend are logged, which is expected here.
   vi.spyOn(console, 'error').mockImplementation(() => {});
+  // So are closed connections of users who lost access.
+  vi.spyOn(console, 'log').mockImplementation(() => {});
 });
 
 afterEach(() => {
   for (const provider of providers.splice(0)) {
     provider.destroy();
   }
+  accessHolds.length = 0;
 });
 
 afterAll(async () => {
@@ -184,6 +249,20 @@ function nextCloseCode(provider: WebsocketProvider): Promise<number | undefined>
   });
 }
 
+/**
+ * Records every close of the providers' connections as `name:code`. The test client reconnects
+ * after a close, so a connection that is connected later may still have been closed.
+ */
+function recordCloses(providers: Record<string, WebsocketProvider>): string[] {
+  const closes: string[] = [];
+  for (const [name, provider] of Object.entries(providers)) {
+    provider.on('connection-close', (event: { code?: number } | null) => {
+      closes.push(`${name}:${event?.code}`);
+    });
+  }
+  return closes;
+}
+
 /** Sends a notification of the backend, e.g. that a project changed. */
 async function notify(path: string, authorization?: string, method = 'POST'): Promise<Response> {
   return fetch(`${httpUrl}${path}`, {
@@ -285,6 +364,13 @@ describe('access', () => {
 
   it.each(['broken', 'no-json', 'no-role', 'unknown-role'])(
     'rejects with 503 if the backend fails (%s)',
+    async (token) => {
+      await expect(rejectionStatus(`/vsum:11?token=${token}`)).resolves.toBe(503);
+    },
+  );
+
+  it.each(['no-user-id', 'text-user-id', 'fractional-user-id', 'negative-user-id', 'unsafe-user-id'])(
+    "rejects with 503 if the backend answers without a valid user ID (%s)",
     async (token) => {
       await expect(rejectionStatus(`/vsum:11?token=${token}`)).resolves.toBe(503);
     },
@@ -974,7 +1060,16 @@ describe('reload notifications', () => {
   });
 
   it('are unknown on other paths', async () => {
-    for (const path of ['/internal/projects/70', '/internal/projects/70/reload/x', '/internal']) {
+    for (const path of [
+      '/internal/projects/70',
+      '/internal/projects/70/reload/x',
+      '/internal',
+      '/internal/projects/70/check',
+      '/internal/users/1/close',
+      '/internal/users/1/reload',
+      '/internal/users/1',
+      '/internal/users/1/check-access/x',
+    ]) {
       expect((await notify(path, await backendToken())).status).toBe(404);
     }
   });
@@ -1014,6 +1109,25 @@ describe('close notifications', () => {
     expect(projects.requests.slice(requests).filter((request) => request.projectId === '60')).toEqual([]);
     expect(carol.wsconnected).toBe(true);
     expect(docs.has('vsum:61')).toBe(true);
+  });
+
+  it('drop what a client sends while the connection is closing, and terminate it if it never completes the close', async () => {
+    projects.add('67');
+    const owner = await connect('vsum:67', 'owner');
+    const doc = docs.get('vsum:67') as WSSharedDoc; // kept: the room is dropped from `docs`
+    const socket = stopReading(owner);
+    projects.missing.add('67');
+
+    expect((await notify('/internal/projects/67/close', await backendToken())).status).toBe(202);
+    // The client hasn't read the server's close, so it still sends its changes.
+    owner.doc.getMap('test').set('afterRemoval', 'Hack');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(doc.getMap('test').has('afterRemoval')).toBe(false);
+    // ws itself would wait 30 seconds before it gives up on the close.
+    await vi.waitFor(() => expect(doc.conns.size).toBe(0), { timeout: 2000 });
+    socket.resume();
+    owner.disconnect();
   });
 
   it('are ignored for a project the backend still has, e.g. one restored before a late notification', async () => {
@@ -1097,6 +1211,618 @@ describe('close notifications', () => {
 
     const logged = vi.mocked(console.error).mock.calls.flat().join(' ');
     expect(logged).toContain('Rejected a close notification');
+    expect(logged).not.toContain(token);
+  });
+});
+
+/** Resolves once `provider` no longer sees a user with the given name, i.e. once that presence was removed. */
+function userLeaves(provider: WebsocketProvider, name: string): Promise<void> {
+  const awareness = provider.awareness;
+  const isThere = () =>
+    [...awareness.getStates().values()].some((state) => state.user?.name === name);
+  return new Promise((resolve) => {
+    if (!isThere()) {
+      resolve();
+      return;
+    }
+    const onChange = () => {
+      if (!isThere()) {
+        awareness.off('change', onChange);
+        resolve();
+      }
+    };
+    awareness.on('change', onChange);
+  });
+}
+
+/**
+ * Stops reading the provider's connection, like a client that never answers the server's close.
+ * The provider doesn't notice the close then, so it keeps sending its changes.
+ */
+function stopReading(provider: WebsocketProvider): WebSocket {
+  const socket = provider.ws as unknown as WebSocket;
+  socket.pause();
+  return socket;
+}
+
+/**
+ * Opens a connection without a provider and resolves with the code it is closed with. Messages it
+ * receives are added to `messages`.
+ */
+function openRaw(pathAndQuery: string, messages: unknown[] = []): Promise<number> {
+  const socket = new WebSocket(`${wsUrl}${pathAndQuery}`);
+  socket.on('message', (message) => messages.push(message));
+  // A rejected handshake is reported as an error and then closes with 1006.
+  socket.on('error', () => {});
+  return new Promise((resolve) => socket.once('close', (code) => resolve(code)));
+}
+
+/** Number of times the fake backend was asked for the user's access to a project. */
+const accessRequests = (projectId: string) =>
+  backend.requests.filter((request) => request.path === `/api/v1/vsums/${projectId}/details`).length;
+
+describe('check-access notifications (project)', () => {
+  const checkAccess = async (projectId: string) =>
+    notify(`/internal/projects/${projectId}/check-access`, await backendToken());
+
+  it('close every connection of a removed member with 4403 and leave the other users alone', async () => {
+    projects.add('100');
+    projects.add('101');
+    const owner = await connect('vsum:100', 'owner');
+    const member2 = await connect('vsum:100', 'member2');
+    const viewer = await connect('vsum:100', 'viewer');
+    const tab = await connect('vsum:100', 'member');
+    const otherTab = await connect('vsum:100', 'member-renewed'); // same user, another token
+    const elsewhere = await connect('vsum:101', 'member'); // the same user in another project
+    const closes = [nextCloseCode(tab), nextCloseCode(otherTab)];
+    const otherCloses = recordCloses({ owner, member2, viewer, elsewhere });
+    projects.membersOf('100').delete(USERS.member);
+
+    const response = await checkAccess('100');
+
+    expect(response.status).toBe(202);
+    expect(await response.text()).toBe('Checked');
+    expect(await Promise.all(closes)).toEqual([4403, 4403]);
+    tab.disconnect();
+    otherTab.disconnect();
+    owner.doc.getMap('test').set('fromOwner', 'Component');
+    member2.doc.getMap('test').set('fromMember', 'Interface');
+    await expect(valueArrives(member2.doc, 'fromOwner')).resolves.toBe('Component');
+    await expect(valueArrives(owner.doc, 'fromMember')).resolves.toBe('Interface');
+    await expect(valueArrives(viewer.doc, 'fromMember')).resolves.toBe('Interface');
+    expect(elsewhere.wsconnected).toBe(true);
+    expect(otherCloses).toEqual([]);
+    expect(console.log).toHaveBeenCalledWith('Closed 2 connection(s) of user 2 to vsum:100: access revoked');
+    await expect(rejectionStatus('/vsum:100?token=member')).resolves.toBe(403);
+  });
+
+  it('close the connection of a removed viewer with 4403, so it receives nothing anymore', async () => {
+    const owner = await connect('vsum:102', 'owner');
+    const viewer = await connect('vsum:102', 'viewer');
+    const closed = nextCloseCode(viewer);
+    projects.membersOf('102').delete(USERS.viewer);
+
+    expect((await checkAccess('102')).status).toBe(202);
+
+    expect(await closed).toBe(4403);
+    viewer.disconnect();
+    expect(owner.wsconnected).toBe(true);
+  });
+
+  it('drop the changes a removed member sends while the connection is closing', async () => {
+    projects.add('103', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const owner = await connect('vsum:103', 'owner');
+    const member = await connect('vsum:103', 'member');
+    const socket = stopReading(member);
+    projects.membersOf('103').delete(USERS.member);
+    const before = serverDoc('vsum:103');
+
+    expect((await checkAccess('103')).status).toBe(202);
+    // The client hasn't read the server's close, so it still sends its changes.
+    member.doc.getMap('test').set('afterRemoval', 'Hack');
+    (member.doc.getMap('models').get('1') as Y.Map<unknown>).set('name', 'Hack');
+    await new Promise((resolve) => setTimeout(resolve, 300)); // longer than the writeback delays
+
+    expect(serverDoc('vsum:103')).toEqual(before);
+    expect(owner.doc.getMap('test').has('afterRemoval')).toBe(false);
+    expect(projects.requests.filter((request) => request.projectId === '103')).toEqual([]);
+    const closed = nextCloseCode(member);
+    socket.resume();
+    expect(await closed).toBe(4403);
+    member.disconnect();
+  });
+
+  it('drop the presence a removed member sends while the connection is closing', async () => {
+    const owner = await connect('vsum:115', 'owner');
+    const member = await connect('vsum:115', 'member');
+    const socket = stopReading(member);
+    projects.membersOf('115').delete(USERS.member);
+    // A presence forwarded to the owner may be removed again right away, so every one is recorded.
+    const seen: unknown[] = [];
+    owner.awareness.on('change', () => {
+      for (const state of owner.awareness.getStates().values()) {
+        if (String(state.user?.name).startsWith('Ghost')) {
+          seen.push(state.user.name);
+        }
+      }
+    });
+
+    expect((await checkAccess('115')).status).toBe(202);
+    // The client hasn't read the server's close, so it still sends its presence. Both are sent
+    // well before the connection is terminated.
+    member.awareness.setLocalStateField('user', { name: 'Ghost' });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    member.awareness.setLocalStateField('user', { name: 'Ghost 2' });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    expect(seen).toEqual([]);
+    const closed = nextCloseCode(member);
+    socket.resume();
+    expect(await closed).toBe(4403);
+    member.disconnect();
+  });
+
+  it('terminate a connection whose client never completes the close, which removes its presence', async () => {
+    const owner = await connect('vsum:104', 'owner');
+    const member = await connect('vsum:104', 'member');
+    member.awareness.setLocalStateField('user', { name: 'Mia' });
+    await userAppears(owner, 'Mia');
+    stopReading(member);
+    projects.membersOf('104').delete(USERS.member);
+
+    expect((await checkAccess('104')).status).toBe(202);
+
+    // ws itself would wait 30 seconds, longer than the test may take.
+    await expect(userLeaves(owner, 'Mia')).resolves.toBeUndefined();
+  });
+
+  it('close the connection of a member who may now only view the project with 4412; the next one is read-only', async () => {
+    const owner = await connect('vsum:105', 'owner');
+    const member = await connect('vsum:105', 'member');
+    const closed = nextCloseCode(member);
+    projects.membersOf('105').set(USERS.member, 'VIEWER');
+
+    expect((await checkAccess('105')).status).toBe(202);
+
+    expect(await closed).toBe(4412);
+    member.destroy();
+    expect(console.log).toHaveBeenCalledWith('Closed 1 connection(s) of user 2 to vsum:105: role changed');
+    const again = await connect('vsum:105', 'member');
+    again.doc.getMap('test').set('fromViewer', 'Hack');
+    // The presence is sent after the change on the same connection, so once it arrived the server
+    // has handled the change as well.
+    again.awareness.setLocalStateField('user', { name: 'Max' });
+    await userAppears(owner, 'Max');
+    expect(docs.get('vsum:105')?.getMap('test').has('fromViewer')).toBe(false);
+  });
+
+  it('keep the connection of a viewer who may now edit, which stays read-only until it reconnects', async () => {
+    const owner = await connect('vsum:106', 'owner');
+    const viewer = await connect('vsum:106', 'viewer');
+    const closes = recordCloses({ viewer });
+    projects.membersOf('106').set(USERS.viewer, 'MEMBER');
+
+    expect((await checkAccess('106')).status).toBe(202);
+
+    viewer.doc.getMap('test').set('fromViewer', 'Hack');
+    viewer.awareness.setLocalStateField('user', { name: 'Vera' });
+    await userAppears(owner, 'Vera'); // the server has handled the change by now
+    expect(viewer.wsconnected).toBe(true);
+    expect(closes).toEqual([]);
+    expect(owner.doc.getMap('test').has('fromViewer')).toBe(false);
+  });
+
+  it('keep the connections of an owner and a member whose roles were swapped', async () => {
+    const owner = await connect('vsum:112', 'owner');
+    const member = await connect('vsum:112', 'member');
+    const closes = recordCloses({ owner, member });
+    projects.membersOf('112').set(USERS.owner, 'MEMBER').set(USERS.member, 'OWNER');
+
+    expect((await checkAccess('112')).status).toBe(202);
+
+    member.doc.getMap('test').set('fromMember', 'Interface');
+    await expect(valueArrives(owner.doc, 'fromMember')).resolves.toBe('Interface');
+    expect(owner.wsconnected && member.wsconnected).toBe(true);
+    expect(closes).toEqual([]);
+  });
+
+  it('close nothing if the notification arrives after the member was added again with the same role', async () => {
+    const owner = await connect('vsum:107', 'owner');
+    const member = await connect('vsum:107', 'member');
+    const closes = recordCloses({ owner, member });
+    projects.membersOf('107').delete(USERS.member);
+    projects.membersOf('107').set(USERS.member, 'MEMBER');
+
+    expect((await checkAccess('107')).status).toBe(202);
+
+    member.doc.getMap('test').set('fromMember', 'Interface');
+    await expect(valueArrives(owner.doc, 'fromMember')).resolves.toBe('Interface');
+    expect(member.wsconnected).toBe(true);
+    expect(closes).toEqual([]);
+  });
+
+  it('are answered with 503 and close nothing if the members cannot be loaded; the repeated notification closes', async () => {
+    const owner = await connect('vsum:108', 'owner');
+    const member = await connect('vsum:108', 'member');
+    projects.membersOf('108').delete(USERS.member);
+    projects.nextMemberLoads.push(new BackendError(503, 'The backend answered GET with status 503'));
+
+    expect((await checkAccess('108')).status).toBe(503);
+    member.doc.getMap('test').set('fromMember', 'Interface');
+    await expect(valueArrives(owner.doc, 'fromMember')).resolves.toBe('Interface');
+    const closed = nextCloseCode(member);
+
+    expect((await checkAccess('108')).status).toBe(202);
+    expect(await closed).toBe(4403);
+    member.disconnect();
+  });
+
+  it('skip connections that were closed while the members were loading', async () => {
+    const owner = await connect('vsum:113', 'owner');
+    const member = await connect('vsum:113', 'member');
+    member.awareness.setLocalStateField('user', { name: 'Mia' });
+    await userAppears(owner, 'Mia');
+    projects.membersOf('113').delete(USERS.member);
+    const loading = gate();
+    projects.nextMemberLoads.push(loading.interruption);
+    const response = checkAccess('113');
+    await vi.waitFor(() => expect(projects.memberLoads).toContain('113'));
+
+    member.disconnect();
+    await userLeaves(owner, 'Mia'); // the server handled the close
+    loading.open();
+
+    expect((await response).status).toBe(202);
+    const logged = vi.mocked(console.log).mock.calls.flat().join(' ');
+    expect(logged).not.toContain('vsum:113');
+  });
+
+  it('compare only connections accepted before the members were asked for', async () => {
+    const owner = await connect('vsum:114', 'owner');
+    const oldTab = await connect('vsum:114', 'member');
+    const oldClosed = nextCloseCode(oldTab);
+    projects.membersOf('114').delete(USERS.member);
+    const loading = gate();
+    projects.nextMemberLoads.push(loading.interruption);
+    const response = checkAccess('114');
+    await vi.waitFor(() => expect(projects.memberLoads).toContain('114'));
+    projects.membersOf('114').set(USERS.member, 'MEMBER'); // added again, after the answer
+    const newTab = await connect('vsum:114', 'member');
+    const closes = recordCloses({ newTab });
+
+    loading.open();
+
+    expect((await response).status).toBe(202);
+    expect(await oldClosed).toBe(4403);
+    oldTab.disconnect();
+    newTab.doc.getMap('test').set('fromNewTab', 'Interface');
+    await expect(valueArrives(owner.doc, 'fromNewTab')).resolves.toBe('Interface');
+    expect(newTab.wsconnected).toBe(true);
+    expect(closes).toEqual([]);
+  });
+
+  it('do nothing, without asking the backend, for a project nobody has open', async () => {
+    const memberLoads = projects.memberLoads.length;
+
+    const response = await checkAccess('109');
+
+    expect(response.status).toBe(202);
+    expect(projects.memberLoads).toHaveLength(memberLoads);
+  });
+
+  it('close the room with 4410 if the backend no longer has the project, once that is confirmed', async () => {
+    projects.add('110');
+    const owner = await connect('vsum:110', 'owner');
+    const closed = nextCloseCode(owner);
+    // In the trash: the members and the project answer 404.
+    projects.missing.add('110');
+
+    expect((await checkAccess('110')).status).toBe(202);
+
+    expect(await closed).toBe(4410);
+    owner.disconnect();
+    expect(docs.has('vsum:110')).toBe(false);
+  });
+
+  it('leave the room alone if the members answer 404 but the backend still has the project', async () => {
+    projects.add('111');
+    const owner = await connect('vsum:111', 'owner');
+    const doc = docs.get('vsum:111');
+    projects.nextMemberLoads.push(new BackendError(404, 'The backend answered GET with status 404'));
+    const loads = projects.loads.length;
+
+    const response = await checkAccess('111');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(response.status).toBe(202);
+    expect(projects.loads.slice(loads)).toEqual(['111']); // the removal was not confirmed
+    expect(owner.wsconnected).toBe(true);
+    expect(docs.get('vsum:111')).toBe(doc);
+  });
+
+  it('accept a connection whose user was removed while it was loading, and close it with 4403 before it gets anything', async () => {
+    projects.add('120', { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const loading = gate();
+    projects.nextLoads.push(loading.interruption);
+    const messages: unknown[] = [];
+    const closed = openRaw('/vsum:120?token=member', messages);
+    await vi.waitFor(() => expect(projects.loads).toContain('120'));
+    projects.membersOf('120').delete(USERS.member);
+
+    expect((await checkAccess('120')).status).toBe(202);
+    loading.open();
+
+    expect(await closed).toBe(4403); // not a rejected handshake (1006)
+    expect(messages).toEqual([]);
+    expect(accessRequests('120')).toBe(2);
+    await vi.waitFor(() => expect(docs.has('vsum:120')).toBe(false)); // its join was released
+  });
+
+  it('accept a connection whose user is still a member after asking for the access again', async () => {
+    const loading = gate();
+    projects.nextLoads.push(loading.interruption);
+    const connecting = connect('vsum:121', 'member');
+    await vi.waitFor(() => expect(projects.loads).toContain('121'));
+
+    expect((await checkAccess('121')).status).toBe(202);
+    loading.open();
+
+    const member = await connecting;
+    expect(member.wsconnected).toBe(true);
+    expect(accessRequests('121')).toBe(2);
+  });
+
+  it('use the role asked for again for a connection whose role was lowered while it was loading', async () => {
+    const loading = gate();
+    projects.nextLoads.push(loading.interruption);
+    const connecting = connect('vsum:123', 'member');
+    await vi.waitFor(() => expect(projects.loads).toContain('123'));
+    projects.membersOf('123').set(USERS.member, 'VIEWER');
+
+    expect((await checkAccess('123')).status).toBe(202);
+    loading.open();
+
+    const member = await connecting;
+    expect(accessRequests('123')).toBe(2); // before another client asks for its access
+    const owner = await connect('vsum:123', 'owner');
+    member.doc.getMap('test').set('fromViewer', 'Hack');
+    // The presence is sent after the change on the same connection, so once it arrived the server
+    // has handled the change as well.
+    member.awareness.setLocalStateField('user', { name: 'Max' });
+    await userAppears(owner, 'Max');
+    expect(docs.get('vsum:123')?.getMap('test').has('fromViewer')).toBe(false);
+  });
+
+  it('accept a connection whose user was removed while its access was being checked, and close it with 4403', async () => {
+    const checking = holdAccess('124');
+    const messages: unknown[] = [];
+    const closed = openRaw('/vsum:124?token=member', messages);
+    await checking.requested;
+    projects.membersOf('124').delete(USERS.member);
+
+    expect((await checkAccess('124')).status).toBe(202);
+    checking.open(); // computed before the removal: still a member
+
+    expect(await closed).toBe(4403);
+    expect(messages).toEqual([]);
+    expect(accessRequests('124')).toBe(2);
+  });
+
+  it('ask for the access once more if another check arrives while it is asked for again', async () => {
+    const loading = gate();
+    projects.nextLoads.push(loading.interruption);
+    const messages: unknown[] = [];
+    const closed = openRaw('/vsum:125?token=member', messages);
+    await vi.waitFor(() => expect(projects.loads).toContain('125'));
+    const checkingAgain = holdAccess('125');
+    expect((await checkAccess('125')).status).toBe(202); // about another user
+    loading.open();
+    await checkingAgain.requested;
+    projects.membersOf('125').delete(USERS.member);
+
+    expect((await checkAccess('125')).status).toBe(202);
+    checkingAgain.open(); // computed before the removal: still a member
+
+    expect(await closed).toBe(4403);
+    expect(messages).toEqual([]);
+    expect(accessRequests('125')).toBe(3);
+  });
+
+  /**
+   * Opens the project as its owner and starts a member's connection, which a check makes ask for
+   * its access again. While that answer, computed before, is held back, the project is removed.
+   * Returns the member's connection and lets the held answer through with `open`.
+   */
+  async function removeWhileAskingAgain(projectId: string) {
+    projects.add(projectId, { metaModels: [{ id: 101, sourceId: 1, name: 'Car' }] });
+    const owner = await connect(`vsum:${projectId}`, 'owner');
+    const ownerClosed = nextCloseCode(owner);
+    const checking = holdAccess(projectId);
+    const messages: unknown[] = [];
+    const closed = openRaw(`/vsum:${projectId}?token=member`, messages);
+    await checking.requested;
+    const checkingAgain = holdAccess(projectId);
+    expect((await checkAccess(projectId)).status).toBe(202); // about another user
+    checking.open();
+    await checkingAgain.requested;
+    projects.missing.add(projectId); // in the trash
+
+    const closeNotification = await notify(`/internal/projects/${projectId}/close`, await backendToken());
+
+    expect(closeNotification.status).toBe(202);
+    expect(await ownerClosed).toBe(4410);
+    owner.disconnect();
+    return { closed, messages, open: checkingAgain.open };
+  }
+
+  it('close a connection with 4410 whose project was removed while it asked for the access again', async () => {
+    const member = await removeWhileAskingAgain('126');
+
+    member.open();
+
+    expect(await member.closed).toBe(4410); // not joined to a document no room manages
+    expect(member.messages).toEqual([]);
+    expect(docs.has('vsum:126')).toBe(false);
+    projects.missing.delete('126'); // restored
+    const owner = await connect('vsum:126', 'owner');
+    expect((owner.doc.getMap('models').get('1') as Y.Map<unknown>).get('name')).toBe('Car');
+  });
+
+  it('close a connection with 4410 whose project was removed while it asked for the access again, also once it was opened again', async () => {
+    const member = await removeWhileAskingAgain('127');
+    projects.missing.delete('127'); // restored
+    const owner = await connect('vsum:127', 'owner');
+    const doc = docs.get('vsum:127');
+
+    member.open();
+
+    expect(await member.closed).toBe(4410); // not joined to the new room
+    expect(member.messages).toEqual([]);
+    expect(docs.get('vsum:127')).toBe(doc);
+    expect(owner.wsconnected).toBe(true);
+  });
+
+  it('do not affect connections that start afterwards, which are rejected with 403', async () => {
+    projects.membersOf('122').delete(USERS.member);
+
+    expect((await checkAccess('122')).status).toBe(202);
+
+    await expect(rejectionStatus('/vsum:122?token=member')).resolves.toBe(403);
+  });
+});
+
+describe('check-access notifications (user)', () => {
+  const checkUserAccess = async (userId: string) =>
+    notify(`/internal/users/${userId}/check-access`, await backendToken());
+
+  /** Removes the user from the projects, like deleting the account does in the backend. */
+  const deleteAccount = (userId: string, ...projectIds: string[]) => {
+    for (const projectId of projectIds) {
+      projects.membersOf(projectId).delete(userId);
+    }
+  };
+
+  it("close the user's connections in every room and leave the other users alone", async () => {
+    const owners = [await connect('vsum:130', 'owner'), await connect('vsum:131', 'owner')];
+    const tabs = [await connect('vsum:130', 'member2'), await connect('vsum:131', 'member2')];
+    const unrelated = await connect('vsum:132', 'owner');
+    const closes = tabs.map((tab) => nextCloseCode(tab));
+    deleteAccount(USERS.member2, '130', '131', '132');
+    const memberLoads = projects.memberLoads.length;
+
+    const response = await checkUserAccess(USERS.member2);
+
+    expect(response.status).toBe(202);
+    expect(await response.text()).toBe('Checked');
+    expect(await Promise.all(closes)).toEqual([4403, 4403]);
+    for (const tab of tabs) {
+      tab.disconnect();
+    }
+    // Only the rooms the user is connected to.
+    expect(projects.memberLoads.slice(memberLoads).sort()).toEqual(['130', '131']);
+    expect([...owners, unrelated].map((provider) => provider.wsconnected)).toEqual([true, true, true]);
+  });
+
+  it('do nothing, without asking the backend, for a user without connections', async () => {
+    const memberLoads = projects.memberLoads.length;
+
+    const response = await checkUserAccess('999');
+
+    expect(response.status).toBe(202);
+    expect(projects.memberLoads).toHaveLength(memberLoads);
+  });
+
+  it('are answered with 503 if the members of one room cannot be loaded, after checking the other rooms', async () => {
+    const tabs = [await connect('vsum:133', 'member2'), await connect('vsum:134', 'member2')];
+    const codes = new Map<WebsocketProvider, number | undefined>();
+    for (const tab of tabs) {
+      void nextCloseCode(tab).then((code) => codes.set(tab, code));
+    }
+    deleteAccount(USERS.member2, '133', '134');
+    projects.nextMemberLoads.push(new BackendError(503, 'The backend answered GET with status 503'));
+
+    expect((await checkUserAccess(USERS.member2)).status).toBe(503);
+
+    await vi.waitFor(() => expect([...codes.values()]).toEqual([4403]));
+    const [closedTab] = codes.keys();
+    closedTab.disconnect();
+    const keptTab = tabs.find((tab) => tab !== closedTab) as WebsocketProvider;
+    expect(keptTab.wsconnected).toBe(true);
+    expect((await checkUserAccess(USERS.member2)).status).toBe(202);
+    await vi.waitFor(() => expect(codes.get(keptTab)).toBe(4403));
+    keptTab.disconnect();
+  });
+
+  it('make connections that are still loading ask for the access again', async () => {
+    projects.add('135');
+    const loading = gate();
+    projects.nextLoads.push(loading.interruption);
+    const closed = openRaw('/vsum:135?token=member2');
+    await vi.waitFor(() => expect(projects.loads).toContain('135'));
+    deleteAccount(USERS.member2, '135');
+
+    expect((await checkUserAccess(USERS.member2)).status).toBe(202);
+    loading.open();
+
+    expect(await closed).toBe(4403);
+    expect(accessRequests('135')).toBe(2);
+  });
+});
+
+describe.each([
+  ['project', (id: string) => `/internal/projects/${id}/check-access`, 'check-access'],
+  ['user', (id: string) => `/internal/users/${id}/check-access`, 'check-user-access'],
+])('check-access notifications (%s)', (_kind, path, notification) => {
+  it.each([
+    ['without token', undefined],
+    ['with an invalid token', 'Bearer not-a-token'],
+  ])('are rejected with 401 %s', async (_name, authorization) => {
+    const response = await notify(path('70'), authorization);
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get('www-authenticate')).toBe('Bearer');
+  });
+
+  it('are rejected with 401 if the token is forged or expired', async () => {
+    for (const options of [{ forged: true }, { expiresIn: -60 }]) {
+      const token = await keycloak.signToken({ roles: [BACKEND_ROLE], ...options });
+
+      expect((await notify(path('70'), `Bearer ${token}`)).status).toBe(401);
+    }
+  });
+
+  it("are rejected with 403 if the token lacks the backend's role", async () => {
+    const userToken = await keycloak.signToken({ roles: ['user'] });
+
+    expect((await notify(path('70'), `Bearer ${userToken}`)).status).toBe(403);
+  });
+
+  it.each(['abc', '012', '-1', '1234567890123456789'])(
+    'are rejected with 400 for the invalid ID %s',
+    async (id) => {
+      expect((await notify(path(id), await backendToken())).status).toBe(400);
+    },
+  );
+
+  it('check the token before the ID', async () => {
+    expect((await notify(path('abc'))).status).toBe(401);
+  });
+
+  it('only accept POST', async () => {
+    const response = await notify(path('70'), await backendToken(), 'GET');
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get('allow')).toBe('POST');
+  });
+
+  it('never log the token', async () => {
+    const token = await keycloak.signToken({ roles: [BACKEND_ROLE], forged: true });
+    await notify(path('70'), `Bearer ${token}`);
+
+    const logged = [...vi.mocked(console.error).mock.calls, ...vi.mocked(console.log).mock.calls]
+      .flat()
+      .join(' ');
+    expect(logged).toContain(`Rejected a ${notification} notification`);
     expect(logged).not.toContain(token);
   });
 });
