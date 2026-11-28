@@ -78,9 +78,21 @@ function parsePort(value: string | undefined): number {
 }
 
 function parseHttpUrl(name: string, value: string): string {
-  const url = value.trim().replace(/\/+$/, '');
+  const url = withoutTrailingSlashes(value.trim());
   if (!URL.canParse(url) || !/^https?:$/.test(new URL(url).protocol)) {
     throw new Error(`${name} must be an http or https URL, but is "${value}"`);
   }
   return url;
+}
+
+/**
+ * Removes all slashes at the end. A loop instead of `replace(/\/+$/, '')`, which backtracks and
+ * takes quadratic time on many slashes followed by another character.
+ */
+function withoutTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value[end - 1] === '/') {
+    end -= 1;
+  }
+  return value.slice(0, end);
 }
