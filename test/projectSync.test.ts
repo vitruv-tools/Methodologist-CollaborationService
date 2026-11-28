@@ -6,6 +6,7 @@ import {
   applyProject,
   DocumentError,
   fillDocument,
+  onAddedMetaModel,
   SERVER_ORIGIN,
   setWritebackError,
   toSyncChanges,
@@ -19,9 +20,10 @@ const LOW_CODE = { name: 'create_corresponding_root_on_insert_root', regenerate:
 const STORED: Partial<StoredProject> = {
   name: 'Brakes',
   metaModels: [
-    { id: 101, sourceId: 1, name: 'Car' },
-    { id: 102, sourceId: 2, name: 'Brake' },
-    { id: 103, sourceId: 3, name: 'Wheel' },
+    { id: 101, sourceId: 1, name: 'Car', ecoreFileId: 201, genModelFileId: 301 },
+    { id: 102, sourceId: 2, name: 'Brake', ecoreFileId: 202, genModelFileId: 302 },
+    // Without genmodel.
+    { id: 103, sourceId: 3, name: 'Wheel', ecoreFileId: 203 },
   ],
   relations: [
     { id: 7, sourceId: 1, targetId: 2, reactionFileStorageId: 50, fineGranularMetaModelRelationSet: [] },
@@ -78,9 +80,9 @@ describe('loading a project', () => {
   it('fills models, relations, views, layout and status', () => {
     expect(doc.toJSON()).toEqual({
       models: {
-        '1': { name: 'Car', softDeleted: false, softDeletedVia: null },
-        '2': { name: 'Brake', softDeleted: false, softDeletedVia: null },
-        '3': { name: 'Wheel', softDeleted: false, softDeletedVia: null },
+        '1': { name: 'Car', projectMetaModelId: 101, ecoreFileId: 201, genModelFileId: 301, softDeleted: false, softDeletedVia: null },
+        '2': { name: 'Brake', projectMetaModelId: 102, ecoreFileId: 202, genModelFileId: 302, softDeleted: false, softDeletedVia: null },
+        '3': { name: 'Wheel', projectMetaModelId: 103, ecoreFileId: 203, genModelFileId: null, softDeleted: false, softDeletedVia: null },
       },
       relations: {
         '7': {
@@ -456,6 +458,152 @@ describe('writing back changes', () => {
     applyBackendState(doc, sent, await backend.getProject('12'), { applied: true });
 
     expect(origins).toEqual([SERVER_ORIGIN]);
+  });
+});
+
+describe("the IDs of the project's copies of the metamodels", () => {
+  /** The copy the backend has of a metamodel, by library ID. */
+  const copy = (sourceId: number) => backend.projects.get('12')?.metaModels.find((model) => model.sourceId === sourceId);
+  const ids = (key: string) => {
+    const model = models().get(key);
+    return {
+      projectMetaModelId: model?.get('projectMetaModelId'),
+      ecoreFileId: model?.get('ecoreFileId'),
+      genModelFileId: model?.get('genModelFileId'),
+    };
+  };
+
+  it('are filled in for a new metamodel once it is written back', async () => {
+    add(models(), '4', { name: 'Seat' });
+
+    await writeBack();
+
+    const created = copy(4);
+    expect(created?.ecoreFileId).toEqual(expect.any(Number));
+    expect(ids('4')).toEqual({
+      projectMetaModelId: created?.id,
+      ecoreFileId: created?.ecoreFileId,
+      genModelFileId: created?.genModelFileId,
+    });
+  });
+
+  it('are filled in also if the outcome of the writeback is unknown', async () => {
+    add(models(), '4', { name: 'Seat' });
+    const { changes, sent } = toSyncChanges(doc, project);
+    await backend.syncChanges('12', changes);
+
+    applyBackendState(doc, sent, await backend.getProject('12'), { applied: false });
+
+    expect(ids('4').ecoreFileId).toBe(copy(4)?.ecoreFileId);
+  });
+
+  it('are removed once the deletion of a metamodel is written back, since the backend deletes the copy', async () => {
+    models().get('3')?.set('softDeleted', true);
+
+    await writeBack();
+
+    expect(ids('3')).toEqual({ projectMetaModelId: null, ecoreFileId: null, genModelFileId: null });
+  });
+
+  it('are those of the new copy after a deleted metamodel was restored and written back', async () => {
+    models().get('3')?.set('softDeleted', true);
+    await writeBack();
+
+    models().get('3')?.set('softDeleted', false);
+    await writeBack();
+
+    expect(ids('3').projectMetaModelId).not.toBe(103);
+    expect(ids('3')).toEqual({
+      projectMetaModelId: copy(3)?.id,
+      ecoreFileId: copy(3)?.ecoreFileId,
+      genModelFileId: copy(3)?.genModelFileId,
+    });
+  });
+
+  it('are filled in with the server origin, and only when they change', async () => {
+    const origins: unknown[] = [];
+    doc.on('update', (_update: Uint8Array, origin: unknown) => origins.push(origin));
+
+    await writeBack();
+    expect(origins).toEqual([]);
+
+    add(models(), '4', { name: 'Seat' });
+    origins.length = 0;
+    await writeBack();
+    expect(origins).toEqual([SERVER_ORIGIN]);
+  });
+
+  it('are not sent to the backend', () => {
+    models().get('1')?.set('ecoreFileId', 999);
+
+    expect(JSON.stringify(toSyncChanges(doc, project).changes)).not.toContain('999');
+  });
+});
+
+describe('noticing that a client added a metamodel', () => {
+  let added: number;
+  let stop: () => void;
+  beforeEach(() => {
+    added = 0;
+    stop = onAddedMetaModel(doc, () => (added += 1));
+  });
+
+  const client = (change: () => void) => doc.transact(change, 'client');
+
+  it('notices a new metamodel', () => {
+    client(() => add(models(), '4', { name: 'Seat' }));
+
+    expect(added).toBe(1);
+  });
+
+  it('notices a metamodel that is restored after it was deleted', () => {
+    client(() => models().get('3')?.set('softDeleted', true));
+    expect(added).toBe(0);
+
+    client(() => models().get('3')?.set('softDeleted', false));
+
+    expect(added).toBe(1);
+  });
+
+  it('notices several metamodels added in one change once', () => {
+    client(() => {
+      add(models(), '4', { name: 'Seat' });
+      add(models(), '5', { name: 'Door' });
+    });
+
+    expect(added).toBe(1);
+  });
+
+  it('ignores renames, deletions, positions and other elements', () => {
+    client(() => models().get('1')?.set('name', 'Vehicle'));
+    client(() => models().get('2')?.set('softDeleted', true));
+    client(() => (doc.getMap('layout').get('metaModels') as YMap<unknown>).set('1', { x: 1, y: 1 }));
+    client(() => add(relations(), 'new-1', { backendId: null, sourceId: 1, targetId: 3, reactionFileId: 51, fineGranular: [] }));
+
+    expect(added).toBe(0);
+  });
+
+  it('ignores a metamodel that is added already deleted, or under a key that is no ID', () => {
+    client(() => add(models(), '4', { name: 'Seat', softDeleted: true }));
+    client(() => add(models(), 'seat', { name: 'Seat' }));
+
+    expect(added).toBe(0);
+  });
+
+  it("ignores the server's own changes", () => {
+    doc.transact(() => add(models(), '4', { name: 'Seat' }), SERVER_ORIGIN);
+    project = { ...project, metaModels: [...(project.metaModels ?? []), { id: 500, sourceId: 6, name: 'Roof' }] };
+    applyProject(doc, project);
+
+    expect(added).toBe(0);
+  });
+
+  it('stops noticing once stopped', () => {
+    stop();
+
+    client(() => add(models(), '4', { name: 'Seat' }));
+
+    expect(added).toBe(0);
   });
 });
 

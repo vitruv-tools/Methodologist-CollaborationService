@@ -86,6 +86,9 @@ function timeOutAfterApplyingNextSync(): void {
   };
 }
 
+/** The copy fields of a metamodel whose copy has no files, as the projects of these tests. */
+const NO_FILES = (projectMetaModelId: number) => ({ projectMetaModelId, ecoreFileId: null, genModelFileId: null });
+
 const storedName = () => backend.projects.get('1')?.metaModels[0].name;
 const writebackError = (doc: Doc) => doc.getMap('status').get('writebackError');
 
@@ -94,8 +97,8 @@ describe('joining', () => {
     const { doc } = await rooms.join('vsum:1', '1');
 
     expect(doc.getMap('models').toJSON()).toEqual({
-      '1': { name: 'Car', softDeleted: false, softDeletedVia: null },
-      '2': { name: 'Brake', softDeleted: false, softDeletedVia: null },
+      '1': { name: 'Car', ...NO_FILES(101), softDeleted: false, softDeletedVia: null },
+      '2': { name: 'Brake', ...NO_FILES(102), softDeleted: false, softDeletedVia: null },
     });
     expect(backend.loads).toEqual(['1']);
   });
@@ -402,6 +405,64 @@ describe('writing back', () => {
     expect(backend.requests).toEqual([]);
   });
 });
+describe('writing back a metamodel a client added', () => {
+  const SLOW = { ...TIMINGS, debounceMs: 60_000, maxWaitMs: 60_000 };
+  const stored = (sourceId: number) => backend.projects.get('1')?.metaModels.find((model) => model.sourceId === sourceId);
+  const addModel = (doc: Doc, key: string) =>
+    edit(doc, () =>
+      doc.getMap('models').set(key, new Y.Map<unknown>(Object.entries({ name: 'Seat', softDeleted: false, softDeletedVia: null }))),
+    );
+  const model = (doc: Doc, key: string) => doc.getMap('models').get(key) as YMap<unknown>;
+
+  it("happens right away, and the document gets the IDs of the project's copy", async () => {
+    rooms = createRooms({ backend, writeback: SLOW });
+    const { doc } = await rooms.join('vsum:1', '1');
+
+    addModel(doc, '3');
+
+    await vi.waitFor(() => expect(stored(3)).toBeDefined());
+    await vi.waitFor(() => expect(model(doc, '3').get('ecoreFileId')).toBe(stored(3)?.ecoreFileId));
+    expect(model(doc, '3').get('projectMetaModelId')).toBe(stored(3)?.id);
+    expect(model(doc, '3').get('genModelFileId')).toBe(stored(3)?.genModelFileId);
+  });
+
+  it('happens right away also for a metamodel that is restored after its deletion was written back', async () => {
+    rooms = createRooms({ backend, writeback: { ...TIMINGS, debounceMs: 400, maxWaitMs: 400 } });
+    const { doc } = await rooms.join('vsum:1', '1');
+    edit(doc, () => model(doc, '2').set('softDeleted', true));
+    await vi.waitFor(() => expect(stored(2)).toBeUndefined());
+
+    edit(doc, () => model(doc, '2').set('softDeleted', false));
+
+    // Well before the 400 ms the deletion waited.
+    await vi.waitFor(() => expect(stored(2)).toBeDefined(), { timeout: 150 });
+    await vi.waitFor(() => expect(model(doc, '2').get('projectMetaModelId')).toBe(stored(2)?.id), { timeout: 150 });
+  });
+
+  it('includes the other changes that were waiting', async () => {
+    rooms = createRooms({ backend, writeback: SLOW });
+    const { doc } = await rooms.join('vsum:1', '1');
+    rename(doc, 'Vehicle');
+
+    addModel(doc, '3');
+
+    await vi.waitFor(() => expect(stored(3)).toBeDefined());
+    expect(storedName()).toBe('Vehicle');
+    expect(backend.requests).toHaveLength(1);
+  });
+
+  it('does not hurry other changes', async () => {
+    rooms = createRooms({ backend, writeback: SLOW });
+    const { doc } = await rooms.join('vsum:1', '1');
+
+    rename(doc, 'Vehicle');
+    edit(doc, () => model(doc, '2').set('softDeleted', true));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(backend.requests).toEqual([]);
+  });
+});
+
 describe('closing', () => {
   it('writes back all rooms and drops them', async () => {
     backend.add('2');

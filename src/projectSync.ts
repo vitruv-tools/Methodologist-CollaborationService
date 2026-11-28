@@ -1,4 +1,4 @@
-import type { Doc, Map as YMap } from 'yjs';
+import type { Doc, Transaction, YEvent, Map as YMap } from 'yjs';
 import type {
   FineGranularDetails,
   MetaModelDetails,
@@ -18,6 +18,7 @@ import {
   STATUS,
   VIEWS,
   WRITEBACK_ERROR,
+  type CopyFields,
   type ModelFields,
   type RelationFields,
   type ViewFields,
@@ -94,7 +95,10 @@ export function fillDocument(doc: Doc, project: ProjectDetails): string[] {
     for (const metaModel of project.metaModels ?? []) {
       const id = libraryId(metaModel);
       if (id !== null) {
-        models.set(String(id), element<ModelFields>({ name: metaModel.name ?? '', ...NOT_DELETED }));
+        models.set(
+          String(id),
+          element<ModelFields>({ name: metaModel.name ?? '', ...copyFields(metaModel), ...NOT_DELETED }),
+        );
       }
     }
 
@@ -294,6 +298,8 @@ export function toSyncChanges(doc: Doc, known: ProjectDetails): SyncRequest {
  * - A sent view without a backend ID, or with one the backend doesn't have, gets the ID of the
  *   backend's view with the name sent; a view without name the one with its file and metamodels.
  * - Backend IDs the backend no longer has are removed.
+ * - Every metamodel gets the IDs of the project's copy the backend has of it, or `null` if the
+ *   backend has none, e.g. after its deletion was written back.
  */
 export function applyBackendState(
   doc: Doc,
@@ -302,6 +308,26 @@ export function applyBackendState(
   { applied }: { applied: boolean },
 ): void {
   doc.transact(() => {
+    const copies = new Map<string, MetaModelDetails>();
+    for (const metaModel of project.metaModels ?? []) {
+      const id = libraryId(metaModel);
+      if (id !== null) {
+        copies.set(String(id), metaModel);
+      }
+    }
+    for (const [key, model] of doc.getMap(MODELS).entries()) {
+      if (!(model instanceof Y.Map)) {
+        continue;
+      }
+      const copy = copies.get(key);
+      for (const [name, value] of Object.entries(copy === undefined ? NO_COPY : copyFields(copy))) {
+        // A metamodel a client added has none of the fields yet; it gets them once it has a copy.
+        if ((model.get(name) ?? null) !== value) {
+          model.set(name, value);
+        }
+      }
+    }
+
     const relations = doc.getMap(RELATIONS);
     const backendRelations = project.metaModelsRelation ?? [];
     const relationsByPair = new Map<string, RelationDetails>();
@@ -402,7 +428,11 @@ export function applyProject(doc: Doc, project: ProjectDetails): string[] {
       const id = libraryId(metaModel);
       if (id !== null) {
         modelKeys.add(String(id));
-        updateElement<ModelFields>(models, String(id), { name: metaModel.name ?? '', ...NOT_DELETED });
+        updateElement<ModelFields>(models, String(id), {
+          name: metaModel.name ?? '',
+          ...copyFields(metaModel),
+          ...NOT_DELETED,
+        });
       }
     }
     deleteOthers(models, modelKeys);
@@ -573,6 +603,45 @@ class ElementKeys {
     this.claimed.add(key);
     return key;
   }
+}
+
+/**
+ * Calls `listener` after each change of a client (any origin but {@link SERVER_ORIGIN}) that adds a
+ * metamodel that isn't deleted, or restores a deleted one. Renames, deletions and positions don't
+ * count. Returns a function that stops listening.
+ */
+export function onAddedMetaModel(doc: Doc, listener: () => void): () => void {
+  const models = doc.getMap(MODELS);
+  const observer = (events: YEvent<YMap<unknown>>[], transaction: Transaction) => {
+    if (transaction.origin !== SERVER_ORIGIN && events.some((event) => addsMetaModel(models, event))) {
+      listener();
+    }
+  };
+  models.observeDeep(observer);
+  return () => models.unobserveDeep(observer);
+}
+
+/** Whether a change below `models` adds a metamodel that isn't deleted, or restores one. */
+function addsMetaModel(models: YMap<unknown>, event: YEvent<YMap<unknown>>): boolean {
+  if (event.target === models) {
+    // A new entry, or one replaced as a whole.
+    return [...event.changes.keys].some(
+      ([key, change]) => change.action !== 'delete' && parseId(key) !== null && isLiveModel(models.get(key)),
+    );
+  }
+  const key = event.path[0];
+  const restored = event.changes.keys.get('softDeleted');
+  return (
+    event.path.length === 1 &&
+    typeof key === 'string' &&
+    parseId(key) !== null &&
+    restored?.oldValue === true &&
+    isLiveModel(event.target)
+  );
+}
+
+function isLiveModel(model: unknown): boolean {
+  return model instanceof Y.Map && field<ModelFields>(model, 'softDeleted') !== true;
 }
 
 /** Reports why the last writeback failed in `status`, or that it succeeded (`null`). */
@@ -860,6 +929,18 @@ function isSameMapping(
 }
 
 const NOT_DELETED = { softDeleted: false, softDeletedVia: null };
+
+/** The copy fields of a metamodel the backend has no copy of. */
+const NO_COPY: CopyFields = { projectMetaModelId: null, ecoreFileId: null, genModelFileId: null };
+
+/** The IDs of the project's copy of a metamodel, as the backend returned it. */
+function copyFields(metaModel: MetaModelDetails): CopyFields {
+  return {
+    projectMetaModelId: idOrNull(metaModel.id),
+    ecoreFileId: idOrNull(metaModel.ecoreFileId),
+    genModelFileId: idOrNull(metaModel.genModelFileId),
+  };
+}
 
 function element<T>(fields: T): YMap<unknown> {
   return new Y.Map<unknown>(Object.entries(fields as Record<string, unknown>));

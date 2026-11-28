@@ -420,8 +420,8 @@ describe('projects', () => {
   it('are loaded when the first user opens them', async () => {
     projects.add('30', {
       metaModels: [
-        { id: 101, sourceId: 1, name: 'Car' },
-        { id: 102, sourceId: 2, name: 'Brake' },
+        { id: 101, sourceId: 1, name: 'Car', ecoreFileId: 201, genModelFileId: 301 },
+        { id: 102, sourceId: 2, name: 'Brake', ecoreFileId: 202 },
       ],
       relations: [
         { id: 7, sourceId: 1, targetId: 2, reactionFileStorageId: 50, fineGranularMetaModelRelationSet: [] },
@@ -433,8 +433,8 @@ describe('projects', () => {
     const { doc } = await connect('vsum:30', 'viewer');
 
     expect(doc.getMap('models').toJSON()).toEqual({
-      '1': { name: 'Car', softDeleted: false, softDeletedVia: null },
-      '2': { name: 'Brake', softDeleted: false, softDeletedVia: null },
+      '1': { name: 'Car', projectMetaModelId: 101, ecoreFileId: 201, genModelFileId: 301, softDeleted: false, softDeletedVia: null },
+      '2': { name: 'Brake', projectMetaModelId: 102, ecoreFileId: 202, genModelFileId: null, softDeleted: false, softDeletedVia: null },
     });
     expect(doc.getMap('relations').toJSON()).toEqual({
       '7': {
