@@ -71,6 +71,21 @@ export const OUTDATED_DOCUMENT_CLOSE_CODE = 4409;
  * `403` until the project is restored from the trash, so clients shouldn't reconnect on their own.
  */
 export const PROJECT_REMOVED_CLOSE_CODE = 4410;
+/**
+ * WebSocket close code with which the server closes the connections of a user who is no longer a
+ * member of the project (removed, or account deleted). Changes not sent yet are lost. Reconnecting
+ * is rejected with `403`, so clients must not reconnect on their own. Close reason:
+ * `Access revoked`.
+ */
+export const ACCESS_REVOKED_CLOSE_CODE = 4403;
+/**
+ * WebSocket close code with which the server closes the connections of a user who may now only
+ * view the project. Clients ask the backend for the role again and connect with a new, empty
+ * document (no epoch), because the role is applied at connect. Close reason: `Role changed`.
+ *
+ * Like the other codes from `4400` to `4499`, it makes y-websocket 3 clients stop reconnecting.
+ */
+export const ROLE_CHANGED_CLOSE_CODE = 4412;
 
 /** Fields every element has. */
 export interface SoftDeletable {

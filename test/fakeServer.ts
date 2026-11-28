@@ -3,7 +3,8 @@ import type { AddressInfo } from 'node:net';
 
 /** What a fake server answers to a request. */
 export type FakeAnswer =
-  | { status: number; body?: unknown }
+  /** Sent once `after` resolved, if given, e.g. to hold back an answer computed when asked. */
+  | { status: number; body?: unknown; after?: Promise<void> }
   /** Never answers, like a server that hangs. */
   | 'hang';
 
@@ -50,8 +51,15 @@ export async function startFakeServer(
       if (result === 'hang') {
         return;
       }
-      response.writeHead(result.status, { 'Content-Type': 'application/json' });
-      response.end(typeof result.body === 'string' ? result.body : JSON.stringify(result.body ?? {}));
+      const respond = () => {
+        response.writeHead(result.status, { 'Content-Type': 'application/json' });
+        response.end(typeof result.body === 'string' ? result.body : JSON.stringify(result.body ?? {}));
+      };
+      if (result.after === undefined) {
+        respond();
+      } else {
+        void result.after.then(respond);
+      }
     });
   });
   await new Promise<void>((resolve) => server.listen(0, resolve));

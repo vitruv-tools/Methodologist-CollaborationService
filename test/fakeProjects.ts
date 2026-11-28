@@ -1,3 +1,4 @@
+import type { Role } from '../src/access.js';
 import {
   BackendError,
   type BackendClient,
@@ -34,6 +35,17 @@ export interface StoredProject {
   layout: unknown;
 }
 
+/**
+ * Members of every project until a test changes them, by user ID: the users of the tokens `owner`,
+ * `member`, `viewer` and `member2` in the server tests.
+ */
+export const DEFAULT_MEMBERS: ReadonlyMap<string, Role> = new Map([
+  ['1', 'OWNER'],
+  ['2', 'MEMBER'],
+  ['3', 'VIEWER'],
+  ['4', 'MEMBER'],
+]);
+
 /** What the fake backend answers or does instead of handling a call normally. */
 export type Interruption =
   | Error
@@ -45,7 +57,7 @@ export type Interruption =
  * backend does in the cases the tests use: relations are matched by their pair of metamodels,
  * views by ID, then name, then file and metamodels, and everything a request doesn't contain is
  * deleted. Every change it makes is listed in {@link changes}, so a request that changes nothing
- * leaves it empty.
+ * leaves it empty. It also lists the members of a project, see {@link membersOf}.
  */
 export class FakeProjects implements BackendClient {
   readonly projects = new Map<string, StoredProject>();
@@ -61,6 +73,12 @@ export class FakeProjects implements BackendClient {
   readonly nextLoads: Interruption[] = [];
   /** Interruptions of the next sync requests, in order. */
   readonly nextSyncs: Interruption[] = [];
+  /** IDs of the projects whose members were loaded, in order. */
+  readonly memberLoads: string[] = [];
+  /** Interruptions of the next loads of members, in order. */
+  readonly nextMemberLoads: Interruption[] = [];
+  /** Members of the projects, by user ID; see {@link membersOf}. */
+  private readonly members = new Map<string, Map<string, Role>>();
   private nextId = 1000;
   /**
    * Reaction files generated for low-code mappings, by relation pair, elements and template: the
@@ -107,6 +125,35 @@ export class FakeProjects implements BackendClient {
       })),
       layout: project.layout,
     });
+  }
+
+  /**
+   * The members of a project by user ID, starting with {@link DEFAULT_MEMBERS}. Tests change the
+   * returned map to remove members or change their roles; the server tests also answer
+   * `GET /api/v1/vsums/{id}/details` from it.
+   */
+  membersOf(projectId: string): Map<string, Role> {
+    let members = this.members.get(projectId);
+    if (members === undefined) {
+      members = new Map(DEFAULT_MEMBERS);
+      this.members.set(projectId, members);
+    }
+    return members;
+  }
+
+  /**
+   * Answers with the members a project has when it is asked, like the real backend: members
+   * changed while an interruption holds the answer back are only in the next answer.
+   */
+  async getMembers(projectId: string): Promise<Map<string, Role>> {
+    this.memberLoads.push(projectId);
+    const missing = this.missing.has(projectId);
+    const members = new Map(this.membersOf(projectId));
+    await this.interrupt(this.nextMemberLoads);
+    if (missing) {
+      throw new BackendError(404, 'The backend answered GET with status 404');
+    }
+    return members;
   }
 
   async syncChanges(projectId: string, changes: SyncChanges): Promise<void> {

@@ -1042,4 +1042,19 @@ describe('removing', () => {
     expect(bob.doc.getMap('status').get('epoch')).not.toBe(epoch);
     expect(nameIn(bob.doc)).toBe('Car');
   });
+
+  it('tells the joins of a dropped room, also once a new room was opened', async () => {
+    const alice = await rooms.join('vsum:1', '1');
+    expect(alice.dropped).toBe(false);
+    removeInBackend();
+    await rooms.remove('vsum:1');
+    backend.missing.delete('1'); // restored
+
+    const bob = await rooms.join('vsum:1', '1');
+
+    expect(alice.dropped).toBe(true);
+    expect(bob.dropped).toBe(false);
+    alice.release();
+    bob.release();
+  });
 });
